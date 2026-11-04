@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>RustMobaX</title>
+    <script>
+      // 首帧主题：App 每次应用主题后会把 id / 明暗 / 11 个基础色写进
+      // localStorage["rustmobax.themeCache"]，这里先照着上一次的样子上色，
+      // 之后再由 App 读回来的真实设置纠正。没有缓存时按系统明暗选，
+      // 避免浅色用户先看到一帧暗色。
+      (function () {
+        var VAR_OF = {
+          bg: "--bg",
+          bgChrome: "--bg-chrome",
+          bgPanel: "--bg-panel",
+          bgHover: "--bg-hover",
+          bgActive: "--bg-active",
+          border: "--border",
+          borderStrong: "--border-strong",
+          text: "--text",
+          textDim: "--text-dim",
+          accent: "--accent",
+          danger: "--danger",
+        };
+        try {
+          var cache = JSON.parse(localStorage.getItem("rustmobax.themeCache") || "null");
+          var root = document.documentElement;
+          if (cache && (cache.kind === "dark" || cache.kind === "light")) {
+            root.setAttribute("data-theme", cache.kind);
+            root.style.colorScheme = cache.kind;
+            if (cache.id) root.setAttribute("data-theme-id", cache.id);
+            for (var key in VAR_OF) {
+              if (cache.colors && typeof cache.colors[key] === "string") {
+                root.style.setProperty(VAR_OF[key], cache.colors[key]);
+              }
+            }
+            return;
+          }
+          var dark =
+            !window.matchMedia || window.matchMedia("(prefers-color-scheme: dark)").matches;
+          root.setAttribute("data-theme", dark ? "dark" : "light");
+          root.style.colorScheme = dark ? "dark" : "light";
+        } catch (err) {
+          // localStorage 不可用（隐私模式等）：交给 App.css 的暗色兜底
+        }
+      })();
+    </script>
+  </head>
+
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

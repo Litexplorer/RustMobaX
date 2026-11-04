@@ -1,0 +1,3409 @@
+/* 主题变量：html[data-theme] 写的是「实际生效」的主题（system 已由 JS 解析成 dark/light），
+   html[data-theme-preference] 只记录用户选择，方便排查 system 的解析结果。
+   :root 一并带一套暗色值兜底 -> 属性还没写上来的第一帧也不会闪白。 */
+:root,
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  color: var(--text);
+  background-color: var(--bg);
+
+  --bg: #16181d;
+  --bg-chrome: #1b1e24;
+  --bg-panel: #1c1f26;
+  --bg-hover: #23272f;
+  --bg-active: #2b3f57;
+  --border: #2a2e37;
+  --border-strong: #3c424e;
+  --text: #d7dae0;
+  --text-dim: #8b919d;
+  --accent: #4a9eff;
+  --danger: #ff6b6b;
+
+  /* 为明暗两套主题补齐的派生色：暗色取值与改造前完全一致，scale=1 时视觉不变 */
+  --bg-input: #14161b;
+  --bg-raised: #22262e;
+  --bg-tab: #1a1d23;
+  --bg-sunken: #191c22;
+  --bg-chip: #262b34;
+  --text-soft: #a8b0bd;
+  --text-faint: #4c525d;
+  --on-accent: #0b1220;
+  --btn-hover: #2b303a;
+  --accent-soft: #223247;
+  --accent-line: rgba(74, 158, 255, 0.35);
+  --danger-bg: #3a2020;
+  --danger-border: #4a2b2b;
+  --danger-soft: #ffb3b3;
+  --control-border: #2a2e37;
+  --overlay: rgba(22, 24, 29, 0.92);
+  --shadow-menu: 0 10px 24px rgba(0, 0, 0, 0.45);
+  --proto-ssh: #6ee7a8;
+  --proto-sftp: #9db6ff;
+  --proto-local: #e8c07a;
+  --warning: #e8c07a;
+}
+
+/* 浅色主题：正文 #1b1f27 对白底约 15:1，次要文字 #4d5563 约 7.6:1；
+   边框 #d3d7de 在 #f5f6f8 上仍可分辨；强调色 #1667c8 配白字约 4.9:1 */
+:root[data-theme="light"] {
+  color-scheme: light;
+  color: var(--text);
+  background-color: var(--bg);
+
+  --bg: #f5f6f8;
+  --bg-chrome: #eceef2;
+  --bg-panel: #ffffff;
+  --bg-hover: #e7eaef;
+  --bg-active: #d3e2fb;
+  --border: #cbd0d9;
+  --border-strong: #8f97a4;
+  --text: #1b1f27;
+  --text-dim: #4d5563;
+  --accent: #1667c8;
+  --danger: #b3261e;
+
+  --bg-input: #ffffff;
+  --bg-raised: #ffffff;
+  --bg-tab: #e9ecf1;
+  --bg-sunken: #f7f8fa;
+  --bg-chip: #e3e6eb;
+  --text-soft: #3f4753;
+  --text-faint: #656c78;
+  --on-accent: #ffffff;
+  --btn-hover: #dfe3ea;
+  --accent-soft: #dbe8fb;
+  --accent-line: rgba(22, 103, 200, 0.3);
+  --danger-bg: #fbe3e1;
+  --danger-border: #e5a9a3;
+  --danger-soft: #8c1d18;
+  --control-border: #8f97a4;
+  --overlay: rgba(245, 246, 248, 0.92);
+  --shadow-menu: 0 10px 24px rgba(15, 23, 42, 0.14);
+  --proto-ssh: #0f7a4d;
+  --proto-sftp: #2b5cbf;
+  --proto-local: #8a5a00;
+  --warning: #8a5a00;
+}
+
+:root {
+  font-family: "Inter", "Helvetica Neue", Arial, "PingFang SC", "Microsoft YaHei",
+    sans-serif;
+  line-height: 1.5;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+
+  /* 界面缩放系数，由 JS 写到 html 的内联样式上；1 = 改造前的视觉 */
+  --ui-scale: 1;
+}
+
+/* 字号兜底：组件里的字号都写成 calc(Npx * var(--ui-scale))，
+   这里给根字号同一条规则，未显式写字号的元素也跟着缩放 */
+html {
+  font-size: calc(13px * var(--ui-scale));
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  height: 100vh;
+  overflow: hidden;
+}
+
+button {
+  font: inherit;
+  color: var(--text);
+  background: var(--bg-hover);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  background: var(--btn-hover);
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+  font-weight: 600;
+}
+
+button.danger {
+  color: var(--danger);
+  border-color: var(--danger-border);
+}
+
+input,
+select {
+  font: inherit;
+  color: var(--text);
+  background: var(--bg-input);
+  border: 1px solid var(--control-border);
+  border-radius: 4px;
+  padding: 4px 7px;
+  width: 100%;
+}
+
+input:focus,
+select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* 键盘导航必须有可见焦点环 -> 上面把默认 outline 关掉的元素统一补回来 */
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* ---------- 外壳 ---------- */
+
+.app-shell {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  height: 100vh;
+}
+
+/* ---------- 菜单栏 ---------- */
+
+.menubar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  /* 用 min-height：缩放调到 125% 时按钮变高不会被 26px 的固定高度裁掉 */
+  min-height: 26px;
+  padding: 0 8px;
+  background: var(--bg-chrome);
+  border-bottom: 1px solid var(--border);
+}
+
+.menu-root {
+  position: relative;
+}
+
+.menu-title {
+  background: transparent;
+  border: none;
+  padding: 2px 9px;
+  border-radius: 3px;
+  font-size: calc(12px * var(--ui-scale));
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+.menu-title:hover,
+.menu-title.is-open {
+  background: var(--bg-hover);
+}
+
+.menu-dropdown {
+  position: absolute;
+  /* 跟随菜单按钮高度下移 2px：放大字号后菜单项不会压住按钮 */
+  top: calc(100% + 2px);
+  left: 0;
+  min-width: 208px;
+  padding: 4px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  box-shadow: var(--shadow-menu);
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+}
+
+.menu-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: transparent;
+  border: none;
+  text-align: left;
+  padding: 5px 10px 5px 6px;
+  border-radius: 4px;
+  font-size: calc(12px * var(--ui-scale));
+  white-space: nowrap;
+}
+
+/* 勾选位固定宽度 -> 有勾与无勾的条目左边对齐 */
+.menu-check {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  flex: none;
+  color: var(--accent);
+}
+
+.menu-item:hover:not(:disabled) {
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+.menu-item:hover:not(:disabled) .menu-check {
+  color: var(--on-accent);
+}
+
+.menu-item:disabled {
+  color: var(--text-dim);
+  opacity: 0.55;
+}
+
+.menu-separator {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--border);
+}
+
+.menubar-spacer {
+  flex: 1;
+}
+
+.menubar-brand {
+  color: var(--text-dim);
+  font-size: calc(11px * var(--ui-scale));
+  letter-spacing: 0.08em;
+}
+
+/* ---------- 工具栏 ---------- */
+
+.toolbar-strip {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-height: 60px;
+  padding: 4px 8px;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+}
+
+.toolbar-button {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  flex: none;
+  /* 内容自适应：四字文案（取消分屏）时按钮自己变宽，文字不出底 */
+  min-width: 58px;
+  height: 44px;
+  padding: 0 8px;
+  white-space: nowrap;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  color: var(--text-dim);
+  transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.toolbar-button:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: var(--border);
+  color: var(--text);
+}
+
+.toolbar-button.is-active {
+  background: var(--bg-active);
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+/* 图标槽固定 32x24 -> 各按钮图标视觉尺寸一致 */
+.toolbar-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 24px;
+}
+
+.toolbar-label {
+  font-size: calc(11px * var(--ui-scale));
+  /* 行高跟着字号走，否则放大后文字会被 13px 的行盒裁到 */
+  line-height: calc(13px * var(--ui-scale));
+  white-space: nowrap;
+}
+
+.toolbar-divider {
+  flex: none;
+  align-self: stretch;
+  width: 1px;
+  margin: 6px 5px;
+  background: var(--border);
+}
+
+/* 右侧留白 -> 按钮组靠左，不与窗口边缘挤在一起 */
+.toolbar-spacer {
+  flex: 1;
+  min-width: 8px;
+}
+
+/* ---------- 工作区 ---------- */
+
+.workspace {
+  --sidebar-width: 280px;
+  position: relative;
+  /* 弹性行布局：侧栏不渲染时主内容自然接管整行，不会掉进第 1 列 */
+  display: flex;
+  flex-direction: row;
+  min-height: 0;
+}
+
+.sidebar {
+  /* 左：32px 竖排图标栏；右：quick connect + 搜索 + 树（监控与跟随开关已移到主区/工具栏） */
+  display: flex;
+  flex-direction: row;
+  flex: 0 0 auto;
+  width: var(--sidebar-width);
+  min-height: 0;
+  background: var(--bg-panel);
+}
+
+.sidebar-main {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* 最左侧 32px 竖排图标栏 */
+.sidebar-rail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+  width: 32px;
+  padding: 6px 0;
+  background: var(--bg-chrome);
+  border-right: 1px solid var(--border);
+}
+
+.rail-button {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  color: var(--text-dim);
+  transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.rail-button:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: var(--border);
+  color: var(--text);
+}
+
+/* 选中态：底色 + 左侧 3px 强调条双标记，不只靠颜色区分 */
+.rail-button.is-active {
+  background: var(--bg-active);
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.rail-button.is-active::before {
+  content: "";
+  position: absolute;
+  left: -4px;
+  top: 3px;
+  bottom: 3px;
+  width: 3px;
+  border-radius: 0 2px 2px 0;
+  background: var(--accent);
+}
+
+/* 键盘聚焦时给一圈可见焦点环，图标栏可以 Tab 进出 */
+.rail-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* ---------- 远程监控（会话主区底部） ---------- */
+
+.monitor-panel {
+  flex: none;
+  padding: 2px 10px 4px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-panel);
+}
+
+/* 折叠标题行：整行可点，来源标记靠右，展开/收起只靠 monitorOpen 一个状态 */
+.monitor-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 3px 2px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  color: var(--text-dim);
+  font-size: calc(11px * var(--ui-scale));
+  text-align: left;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+.monitor-head:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: transparent;
+  color: var(--text);
+}
+
+.monitor-title {
+  flex: none;
+}
+
+.monitor-caret {
+  display: flex;
+  flex: none;
+  transition: transform 0.15s ease;
+}
+
+.monitor-caret.is-open {
+  transform: rotate(90deg);
+}
+
+/* 来源标记：靠右、过长省略，完整值在 title 里 */
+.monitor-source {
+  flex: none;
+  margin-left: auto;
+  max-width: 46%;
+  padding: 0 4px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text-dim);
+  font-size: calc(10px * var(--ui-scale));
+  line-height: 1.5;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.monitor-source.is-remote {
+  border-color: var(--proto-ssh);
+  color: var(--text);
+}
+
+.monitor-source.is-unavailable {
+  border-style: dashed;
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+/* 降级说明：只说清数据来源，不抢指标块的位置 */
+.monitor-note {
+  margin: 0 0 4px;
+  color: var(--text-dim);
+  font-size: calc(10px * var(--ui-scale));
+  line-height: 1.5;
+}
+
+/* 指标条：高度固定，窗口变窄时横向滚动而不是把每个块挤扁 */
+.monitor-strip {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  height: 88px;
+  padding-bottom: 2px;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+/* 单个指标块：标题 / 主数值 / 进度条 / 副行，纵向居中；
+   宽度按内容自适应，太长的 GPU 名称用省略号截断（完整名在 title 里）。
+   上限给到 320px：常见显卡名精简后（如 GP107 [GeForce GTX 1050 Ti]）能整行放下，
+   更长的仍然由 max-width + 省略号收住；`100%` 兜底保证单个块绝不撑破指标条，
+   窗口拉宽时块跟着内容变宽，而不是死守一个固定像素。 */
+.monitor-card {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 3px;
+  max-width: min(320px, 100%);
+  padding: 4px 8px;
+  background: var(--bg-chrome);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-dim);
+  font-size: calc(10px * var(--ui-scale));
+  font-variant-numeric: tabular-nums;
+}
+
+.monitor-card.is-empty {
+  border-style: dashed;
+  color: var(--text-faint);
+}
+
+.monitor-card-title {
+  overflow: hidden;
+  color: var(--text-dim);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.monitor-card-value {
+  color: var(--text);
+  font-size: calc(12px * var(--ui-scale));
+  white-space: nowrap;
+}
+
+.monitor-card-detail {
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.monitor-card-empty {
+  color: var(--text-faint);
+  font-size: calc(11px * var(--ui-scale));
+  white-space: nowrap;
+}
+
+/* 只认出型号、采不到指标时的说明行：比数值更弱的次要文字，明确告诉用户「不是 0」 */
+.monitor-card-note {
+  color: var(--text-faint);
+  font-size: calc(10px * var(--ui-scale));
+  white-space: nowrap;
+}
+
+/* 进度条：轨道用悬停底色，填充按占用率上色 */
+.monitor-bar {
+  display: block;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--bg-hover);
+  overflow: hidden;
+}
+
+.monitor-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--accent);
+  transition: width 0.3s ease;
+}
+
+/* 七成起琥珀、九成起告警：颜色只是辅助，主数值本身始终可读 */
+.monitor-card.is-high .monitor-bar-fill {
+  background: var(--warning);
+}
+
+.monitor-card.is-critical .monitor-bar-fill {
+  background: var(--danger);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .monitor-bar-fill {
+    transition: none;
+  }
+}
+
+.quick-connect,
+.tree-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  margin-bottom: 6px;
+}
+
+.quick-connect:focus-within,
+.tree-search:focus-within {
+  border-color: var(--accent);
+}
+
+.quick-connect-icon,
+.tree-search-icon {
+  display: flex;
+  color: var(--text-dim);
+}
+
+.quick-connect input,
+.tree-search input {
+  border: none;
+  background: transparent;
+  padding: 6px 0;
+}
+
+.quick-connect input:focus,
+.tree-search input:focus {
+  border: none;
+}
+
+.sidebar-section-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 4px 6px;
+  color: var(--text-dim);
+  font-size: calc(11px * var(--ui-scale));
+  letter-spacing: 0.04em;
+}
+
+.sidebar-count {
+  padding: 0 5px;
+  border-radius: 8px;
+  background: var(--bg-chip);
+  font-size: calc(10px * var(--ui-scale));
+}
+
+.tree-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-bottom: 8px;
+}
+
+/* ---------- 会话树 ---------- */
+
+.session-tree {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.tree-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  border-radius: 4px;
+  cursor: pointer;
+  padding: 4px 6px;
+  min-height: 24px;
+}
+
+.tree-row:hover {
+  background: var(--bg-hover);
+}
+
+.tree-row.is-active {
+  background: var(--bg-active);
+}
+
+.tree-row.is-drop-target {
+  outline: 1px dashed var(--accent);
+  outline-offset: -1px;
+  background: var(--accent-soft);
+}
+
+.tree-drop-root {
+  margin: 8px 4px 0;
+  padding: 10px 8px;
+  border: 1px dashed transparent;
+  border-radius: 5px;
+  color: var(--text-faint);
+  font-size: calc(10px * var(--ui-scale));
+  text-align: center;
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.tree-drop-root.is-active {
+  border-color: var(--border-strong);
+  color: var(--text-dim);
+}
+
+.tree-row.is-dragging {
+  opacity: 0.5;
+}
+
+.group-toggle {
+  display: flex;
+  color: var(--text-dim);
+  flex: none;
+}
+
+.group-icon,
+.session-icon {
+  display: flex;
+  flex: none;
+  color: var(--text-dim);
+}
+
+.session-icon.protocol-ssh {
+  color: var(--proto-ssh);
+}
+
+.session-icon.protocol-sftp {
+  color: var(--proto-sftp);
+}
+
+.session-icon.protocol-local {
+  color: var(--proto-local);
+}
+
+.group-name,
+.session-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.group-count {
+  color: var(--text-dim);
+  font-size: calc(10px * var(--ui-scale));
+}
+
+.session-target {
+  max-width: 96px;
+  color: var(--text-dim);
+  font-size: calc(10px * var(--ui-scale));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.row-actions {
+  display: none;
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  gap: 3px;
+  background: var(--bg-hover);
+  padding-left: 6px;
+}
+
+.tree-row.is-active .row-actions {
+  background: var(--bg-active);
+}
+
+.tree-row:hover .row-actions {
+  display: flex;
+}
+
+.row-actions button {
+  font-size: calc(10px * var(--ui-scale));
+  padding: 1px 5px;
+}
+
+.empty-hint,
+.tree-empty {
+  color: var(--text-dim);
+  font-size: calc(11px * var(--ui-scale));
+  padding: 6px;
+}
+
+.tree-empty {
+  padding: 28px 10px;
+  text-align: center;
+  line-height: 1.9;
+}
+
+/* ---------- 侧栏分页（图标栏 + 内容区） ---------- */
+
+/* 收起侧栏只做 display:none -> 组件仍挂载，「文件」分页的 SFTP 连接不会断 */
+.sidebar.is-hidden {
+  display: none;
+}
+
+/* 分页标题条：图标栏右侧的第一行，靠 count 补会话数量 */
+.sidebar-page-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  flex: none;
+  min-height: 26px;
+  padding: 8px 8px 2px;
+  color: var(--text-dim);
+  font-size: calc(11px * var(--ui-scale));
+  letter-spacing: 0.04em;
+}
+
+.sidebar-page-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 一块分页正文：自己占满剩余高度并内部滚动，切页只切显隐 */
+.sidebar-page {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  padding: 6px 8px 0;
+}
+
+/* 上面的 display:flex 会盖掉浏览器对 [hidden] 的默认样式，这里显式兜住 */
+.sidebar-page[hidden] {
+  display: none;
+}
+
+/* 文件分页自带工具条与内边距 -> 正文直接铺满侧栏 */
+.sidebar-page-flush {
+  padding: 0;
+  overflow: hidden;
+}
+
+/* 面板用 flex 撑满分页高度，不依赖百分比高度在不同 WebView 里的差异 */
+.sidebar-page-flush > * {
+  flex: 1;
+  min-height: 0;
+}
+
+/* 工具/宏这类纯列表页的滚动容器 */
+.sidebar-page-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+/* ---------- 工具分页 ---------- */
+
+.tool-group {
+  margin-bottom: 10px;
+}
+
+.tool-group-title {
+  margin: 0 0 3px;
+  padding: 0 2px;
+  color: var(--text-dim);
+  font-size: calc(11px * var(--ui-scale));
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+/* 整行都是可点区域：图标 + 名称 + 第二行灰色说明 */
+.tool-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  width: 100%;
+  padding: 5px 6px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  /* 只过渡颜色 -> hover 不改变尺寸，列表不会抖 */
+  transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.tool-row:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: var(--border);
+}
+
+.tool-row:disabled {
+  cursor: not-allowed;
+  color: var(--text-dim);
+}
+
+.tool-row-icon {
+  display: flex;
+  flex: none;
+  margin-top: 1px;
+  color: var(--text-dim);
+}
+
+.tool-row-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.tool-row-label {
+  font-size: calc(12px * var(--ui-scale));
+}
+
+.tool-row-hint {
+  color: var(--text-dim);
+  font-size: calc(11px * var(--ui-scale));
+  line-height: 1.4;
+}
+
+/* ---------- 侧栏空态（宏分页、文件分页的提示） ---------- */
+
+.sidebar-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 26px 6px;
+  text-align: center;
+  color: var(--text-dim);
+}
+
+.sidebar-empty-icon {
+  display: flex;
+  color: var(--text-dim);
+  opacity: 0.8;
+}
+
+.sidebar-empty-title {
+  margin: 0;
+  color: var(--text);
+  font-size: calc(13px * var(--ui-scale));
+  font-weight: 600;
+}
+
+.sidebar-empty-text {
+  margin: 0;
+  max-width: 30ch;
+  font-size: calc(11px * var(--ui-scale));
+  line-height: 1.6;
+}
+
+/* 未实现的入口一律禁用：光标与透明度都说明它点不动 */
+.sidebar-empty-action {
+  margin-top: 4px;
+  padding: 3px 10px;
+}
+
+.sidebar-empty-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+/* ---------- 侧栏拖动条 ---------- */
+
+/* 7px 命中区里画 1px 竖线；hover/拖动时线变强调色（只过渡颜色，宽度瞬时跟随） */
+.sidebar-resizer {
+  position: relative;
+  flex: 0 0 auto;
+  width: 7px;
+  background: transparent;
+  cursor: col-resize;
+  touch-action: none;
+  transition: background-color 0.15s ease;
+}
+
+.sidebar-resizer::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 3px;
+  width: 1px;
+  background: var(--border);
+  transition: background-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.sidebar-resizer:hover,
+.sidebar-resizer.is-dragging {
+  background: var(--accent-soft);
+}
+
+.sidebar-resizer:hover::after,
+.sidebar-resizer.is-dragging::after,
+.sidebar-resizer:focus-visible::after {
+  background: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent-line);
+}
+
+.sidebar-resizer:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* 拖动期间禁掉文本选中：指针滑到终端上方也不会选中终端文字 */
+body.is-resizing-sidebar,
+body.is-resizing-sidebar * {
+  user-select: none;
+}
+
+/* ---------- 主内容 ---------- */
+
+.content {
+  display: flex;
+  flex-direction: column;
+  /* 与 .sidebar 同一弹性行：侧栏在时让出宽度，侧栏收起时吃满整行 */
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+}
+
+.tabbar {
+  display: flex;
+  align-items: stretch;
+  min-height: 30px;
+  padding: 3px 6px 0;
+  background: var(--bg-chrome);
+  border-bottom: 1px solid var(--border);
+}
+
+/* 标签横向滚动，折叠按钮固定在右侧不跟着滚 */
+.tabbar-tabs {
+  display: flex;
+  align-items: stretch;
+  gap: 1px;
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.tabbar-empty {
+  align-self: center;
+  padding: 0 6px;
+  color: var(--text-dim);
+  font-size: calc(11px * var(--ui-scale));
+}
+
+.tabbar-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 22px;
+  height: 22px;
+  margin: 2px 0 2px 6px;
+  padding: 0;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  color: var(--text-dim);
+  transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.tabbar-toggle:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: var(--border);
+  color: var(--text);
+}
+
+.tab {
+  display: flex;
+  align-items: center;
+  flex: none;
+  gap: 5px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-bottom: none;
+  border-radius: 5px 5px 0 0;
+  background: var(--bg-tab);
+  color: var(--text-dim);
+  cursor: pointer;
+  max-width: 240px;
+}
+
+/* 未激活态的 hover 只做「略亮」：换背景 + 文字提一档，
+   始终弱于激活态（激活态另有顶部强调线 + 更亮的 --bg-active 底 + 加粗），
+   所以不会出现「hover 比当前标签还抢眼」的问题。 */
+.tab:hover:not(.is-active) {
+  background: var(--bg-hover);
+  color: var(--text-soft);
+}
+
+.tab.is-active {
+  background: var(--bg-active);
+  color: var(--text);
+  border-color: var(--border-strong);
+  font-weight: 600;
+  /* 顶部 2px 强调线用 inset 阴影画在盒子内部，不占布局，
+     因此 tab 的高度 / 内边距 / 宽度都不变，点击坐标不受影响 */
+  box-shadow: inset 0 2px 0 var(--accent);
+}
+
+/* 激活态底色偏蓝，10px 副标题跟着提一档，否则会显得发灰 */
+.tab.is-active .tab-subtitle {
+  color: var(--text-soft);
+}
+
+.tab-icon {
+  display: flex;
+  flex: none;
+  color: var(--text-dim);
+}
+
+.tab-icon.protocol-ssh {
+  color: var(--proto-ssh);
+}
+
+.tab-icon.protocol-sftp {
+  color: var(--proto-sftp);
+}
+
+.tab-icon.protocol-local {
+  color: var(--proto-local);
+}
+
+.tab-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab-subtitle {
+  color: var(--text-dim);
+  font-size: calc(10px * var(--ui-scale));
+  max-width: 110px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab-close {
+  display: flex;
+  padding: 1px;
+  border: none;
+  background: transparent;
+  /* 跟随所在 tab 的文字色：未激活时仍是 --text-dim，激活 tab 里就是更亮的 --text，
+     关闭 × 因此在激活态下自动清晰可见；hover 的红底红字规则在其后仍会覆盖 */
+  color: inherit;
+  border-radius: 3px;
+}
+
+.tab-close:hover {
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+.tab-body {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.tab-pane {
+  position: absolute;
+  inset: 0;
+}
+
+.tab-pane.is-hidden {
+  display: none;
+}
+
+.detail-page {
+  height: 100%;
+  overflow-y: auto;
+  padding: 18px 22px;
+}
+
+/* ---------- 终端 ---------- */
+
+.terminal-panel {
+  position: relative;
+  height: 100%;
+}
+
+.terminal-host {
+  height: 100%;
+  padding: 6px 2px 4px 8px;
+}
+
+.terminal-host .xterm {
+  height: 100%;
+}
+
+.terminal-host .xterm-viewport {
+  background-color: transparent !important;
+}
+
+/* 面板右上角的小工具条，平时半透明，鼠标进面板才完全显形 */
+.terminal-tools {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  display: flex;
+  gap: 4px;
+  opacity: 0.35;
+  transition: opacity 0.12s ease;
+}
+
+.terminal-panel:hover .terminal-tools {
+  opacity: 1;
+}
+
+.terminal-tool {
+  display: flex;
+  align-items: center;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-panel);
+  color: var(--text-dim);
+}
+
+.terminal-tool:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+/* 搜索条浮在终端右上角，避免占掉终端行数 */
+.terminal-search {
+  position: absolute;
+  top: 30px;
+  right: 6px;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  background: var(--bg-panel);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
+}
+
+.terminal-search-input {
+  width: 170px;
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: calc(12px * var(--ui-scale));
+}
+
+.terminal-search-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.terminal-search-count {
+  min-width: 46px;
+  color: var(--text-dim);
+  font-size: calc(11px * var(--ui-scale));
+  text-align: center;
+}
+
+.terminal-search-button {
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-hover);
+  color: var(--text-dim);
+  font-size: calc(11px * var(--ui-scale));
+}
+
+.terminal-search-button:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+/* 分屏容器：两块面板等宽，各自独立终端 */
+.terminal-split {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+}
+
+.terminal-pane {
+  flex: 1 1 0;
+  min-width: 0;
+  height: 100%;
+}
+
+.terminal-pane + .terminal-pane {
+  border-left: 1px solid var(--border);
+}
+
+.terminal-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--overlay);
+  color: var(--text-dim);
+  font-size: calc(12px * var(--ui-scale));
+}
+
+.terminal-overlay.is-error {
+  color: var(--danger-soft);
+}
+
+/* ---------- 详情 ---------- */
+
+.detail-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.detail-header h2 {
+  margin: 0 0 4px;
+  font-size: calc(18px * var(--ui-scale));
+}
+
+.detail-sub {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: calc(11px * var(--ui-scale));
+}
+
+.detail-actions {
+  display: flex;
+  gap: 6px;
+  flex: none;
+}
+
+.detail-grid {
+  display: grid;
+  grid-template-columns: 92px 1fr;
+  gap: 7px 16px;
+  margin: 18px 0 0;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-panel);
+}
+
+.detail-grid dt {
+  color: var(--text-dim);
+}
+
+.detail-grid dd {
+  margin: 0;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+.detail-empty {
+  color: var(--text-dim);
+}
+
+.terminal-placeholder {
+  margin-top: 16px;
+  padding: 12px 14px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 6px;
+  color: var(--text-dim);
+  font-size: calc(12px * var(--ui-scale));
+}
+
+/* RDP / VNC 降级方案：详情页里「用系统客户端打开」区块 */
+.remote-desktop {
+  margin-top: 16px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-panel);
+}
+
+.remote-desktop h3 {
+  margin: 0 0 6px;
+  font-size: calc(13px * var(--ui-scale));
+}
+
+.remote-desktop-note {
+  margin: 0 0 8px;
+  color: var(--text-dim);
+  font-size: calc(12px * var(--ui-scale));
+}
+
+/* 「未检测到客户端」这一行要压过引导文字，用正文色强调 */
+.remote-desktop-note.is-strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.remote-desktop-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.remote-desktop-hints {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  color: var(--text-dim);
+  font-size: calc(12px * var(--ui-scale));
+}
+
+/* 安装命令要能整条选中复制 -> 等宽字体 + 可换行，也不加用户选择限制 */
+.remote-desktop-hints code {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  word-break: break-all;
+  user-select: text;
+}
+
+.remote-desktop-error {
+  margin: 10px 0 0;
+  color: var(--danger-soft);
+  font-size: calc(12px * var(--ui-scale));
+}
+
+.welcome {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  gap: 6px;
+  color: var(--text-dim);
+  text-align: center;
+}
+
+.welcome-logo {
+  color: var(--accent);
+  opacity: 0.85;
+}
+
+.welcome h2 {
+  margin: 4px 0 0;
+  color: var(--text);
+  font-size: calc(22px * var(--ui-scale));
+  letter-spacing: 0.02em;
+}
+
+.welcome p {
+  margin: 0;
+}
+
+.welcome-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+/* ---------- 状态栏 ---------- */
+
+.statusbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 28px;
+  padding: 0 10px;
+  background: var(--bg-chrome);
+  border-top: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: calc(11px * var(--ui-scale));
+}
+
+.statusbar.is-error .status-text {
+  color: var(--danger-soft);
+}
+
+.status-text {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status-meta {
+  flex: none;
+}
+
+.status-close {
+  flex: none;
+  border: none;
+  background: transparent;
+  padding: 0 3px;
+  color: var(--text-dim);
+}
+
+/* 右下角指标位：本轮只占位，样式按真实数据（等宽数字）先做好 */
+.status-metrics {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+
+.metric-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 18px;
+  padding: 0 6px;
+  background: var(--bg-chrome);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-dim);
+  font-family: "SFMono-Regular", "Consolas", "Liberation Mono", monospace;
+  font-size: calc(10px * var(--ui-scale));
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 指标来源标记：文字写明远端域名或「本机」，颜色只是辅助 */
+.metric-source {
+  display: inline-flex;
+  align-items: center;
+  max-width: 132px;
+  height: 18px;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-chrome);
+  color: var(--text-dim);
+  font-family: "SFMono-Regular", "Consolas", "Liberation Mono", monospace;
+  font-size: calc(10px * var(--ui-scale));
+  line-height: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 远端：实线边框 + 正常文字色，和本机（灰字）不必靠颜色也能分开 */
+.metric-source.is-remote {
+  border-color: var(--proto-ssh);
+  color: var(--text);
+}
+
+/* 不可用：虚线边框 + 警示色，文字本身也写着「不可用」 */
+.metric-source.is-unavailable {
+  border-style: dashed;
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.metric-label {
+  letter-spacing: 0.04em;
+}
+
+.metric-value {
+  min-width: 14px;
+  color: var(--text);
+  text-align: right;
+}
+
+/* ---------- 弹窗 ---------- */
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  z-index: 100;
+}
+
+.modal {
+  width: 100%;
+  max-width: 560px;
+  max-height: 86vh;
+  overflow-y: auto;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  padding: 16px 18px;
+}
+
+.modal-small {
+  max-width: 400px;
+}
+
+.modal.is-danger {
+  border-color: var(--danger-border);
+}
+
+.fingerprint {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: calc(11px * var(--ui-scale));
+  word-break: break-all;
+}
+
+.modal h2 {
+  margin: 0 0 12px;
+  font-size: calc(16px * var(--ui-scale));
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 10px;
+  flex: 1;
+}
+
+.field span {
+  color: var(--text-dim);
+  font-size: calc(11px * var(--ui-scale));
+}
+
+.field-row {
+  display: flex;
+  gap: 10px;
+}
+
+.field-narrow {
+  max-width: 96px;
+}
+
+.form-error {
+  margin: 0 0 10px;
+  color: var(--danger);
+  font-size: calc(12px * var(--ui-scale));
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.confirm-message {
+  margin: 0 0 14px;
+  line-height: 1.7;
+}
+
+/* 多行粘贴预览：只读、限制高度，避免长文本把弹窗撑爆 */
+.paste-preview {
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  max-height: 120px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, "Courier New", monospace;
+  font-size: calc(12px * var(--ui-scale));
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.paste-more {
+  margin: 0 0 14px;
+  color: var(--text-dim);
+  font-size: calc(12px * var(--ui-scale));
+}
+
+.about-tagline {
+  margin: 0 0 12px;
+  color: var(--text-dim);
+  font-size: calc(12px * var(--ui-scale));
+}
+
+.summary {
+  display: grid;
+  grid-template-columns: auto auto;
+  gap: 4px 16px;
+  margin: 0 0 14px;
+}
+
+.summary dt {
+  color: var(--text-dim);
+}
+
+.summary dd {
+  margin: 0;
+}
+
+.credential-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.credential-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.credential-label {
+  font-size: calc(13px * var(--ui-scale));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 已知主机表：固定布局让长指纹用省略号收起，完整值放在 title 里 */
+.known-host-table {
+  width: 100%;
+  margin-top: 8px;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: calc(12px * var(--ui-scale));
+}
+
+.known-host-table th {
+  padding: 4px 6px;
+  text-align: left;
+  font-weight: 600;
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--border-strong);
+}
+
+.known-host-table td {
+  padding: 5px 6px;
+  border-bottom: 1px solid var(--border);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.known-host-table .fingerprint-cell {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: calc(11px * var(--ui-scale));
+  color: var(--text-dim);
+}
+
+.known-host-table .row-actions {
+  text-align: right;
+}
+
+.known-host-table .row-actions button {
+  padding: 2px 8px;
+  font-size: calc(11px * var(--ui-scale));
+}
+
+.preview-block {
+  margin-bottom: 12px;
+}
+
+.preview-block h3 {
+  margin: 0 0 6px;
+  font-size: calc(12px * var(--ui-scale));
+  color: var(--text-dim);
+}
+
+.preview-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: calc(12px * var(--ui-scale));
+  line-height: 1.8;
+}
+
+.preview-list.skipped {
+  color: var(--warning);
+}
+
+.preview-list .more {
+  color: var(--text-dim);
+  list-style: none;
+  margin-left: -14px;
+}
+
+/* ---------- 会话设置弹窗 ---------- */
+
+.modal-wide {
+  max-width: 640px;
+  padding: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  background: var(--bg-chrome);
+  border-bottom: 1px solid var(--border);
+}
+
+.dialog-header h2 {
+  margin: 0;
+  font-size: calc(14px * var(--ui-scale));
+  font-weight: 600;
+}
+
+.dialog-close {
+  display: flex;
+  padding: 3px;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  border-radius: 3px;
+}
+
+.dialog-close:hover {
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+.protocol-strip {
+  display: flex;
+  gap: 4px;
+  padding: 8px 14px;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border);
+}
+
+.protocol-button {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  min-width: 60px;
+  padding: 6px 8px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  color: var(--text-dim);
+}
+
+.protocol-button:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.protocol-button.is-active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.protocol-button-icon {
+  display: flex;
+}
+
+.protocol-button-caption {
+  font-size: calc(10px * var(--ui-scale));
+}
+
+.dialog-body {
+  flex: 1;
+  min-height: 200px;
+  max-height: 56vh;
+  overflow-y: auto;
+  padding: 12px 14px;
+}
+
+.protocol-hint {
+  margin: 0;
+  padding: 44px 0;
+  text-align: center;
+  color: var(--text-dim);
+}
+
+.settings-group {
+  margin-bottom: 12px;
+  padding: 10px 12px 4px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-sunken);
+}
+
+.settings-group h3 {
+  margin: 0 0 8px;
+  font-size: calc(12px * var(--ui-scale));
+  font-weight: 600;
+  color: var(--text-soft);
+}
+
+.setting-row {
+  display: grid;
+  grid-template-columns: 128px 1fr;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.setting-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-dim);
+  font-size: calc(12px * var(--ui-scale));
+}
+
+.required {
+  color: var(--danger);
+}
+
+.setting-note {
+  color: var(--text-dim);
+  font-size: calc(11px * var(--ui-scale));
+}
+
+.inline-check {
+  width: auto;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.input-narrow {
+  max-width: 110px;
+}
+
+/* 串口设备：下拉只是已枚举设备的快捷方式，可编辑输入框才是真值 -> 纵向堆叠 */
+.serial-port-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.serial-port-picker input {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: calc(12px * var(--ui-scale));
+}
+
+.path-row {
+  display: flex;
+  gap: 6px;
+}
+
+.path-row input {
+  flex: 1;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: calc(12px * var(--ui-scale));
+}
+
+.path-row button {
+  flex: none;
+  white-space: nowrap;
+}
+
+.dialog-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 10px 14px;
+  background: var(--bg-chrome);
+  border-top: 1px solid var(--border);
+}
+
+/* ---------- SFTP 面板 ---------- */
+
+.sftp-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: var(--bg-panel);
+  /* 拖放覆盖层与上传下拉都以面板为定位参照 */
+  position: relative;
+}
+
+/* 顶部一行：本面板操作的是远端机器上的目录，路径过长省略中间以外只截尾 */
+.sftp-remote {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-chrome);
+  color: var(--text-dim);
+  font-size: calc(11px * var(--ui-scale));
+}
+
+/* 「远端」小标签：文字直说口径，不靠颜色单一传达 */
+.sftp-remote-tag {
+  flex: none;
+  padding: 0 5px;
+  border: 1px solid var(--proto-ssh);
+  border-radius: 3px;
+  color: var(--text);
+  font-size: calc(10px * var(--ui-scale));
+  line-height: 1.5;
+}
+
+.sftp-remote-target {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: calc(11px * var(--ui-scale));
+}
+
+.sftp-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-chrome);
+}
+
+.sftp-toolbar button {
+  flex: none;
+  white-space: nowrap;
+}
+
+/* 工具栏末尾的「跟随终端」开关：与按钮同高、靠右收尾；
+   侧栏变窄时文字缩成「跟随」，语义由 title / aria-label 补全，不挤爆工具栏 */
+.sftp-follow {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  margin-left: auto;
+  padding: 0 2px;
+  color: var(--text-dim);
+  font-size: calc(11px * var(--ui-scale));
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.sftp-follow:hover {
+  color: var(--text);
+}
+
+.sftp-follow input[type="checkbox"] {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  margin: 0;
+  padding: 0;
+  accent-color: var(--accent);
+}
+
+.sftp-path {
+  flex: 1;
+  min-width: 0;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: calc(12px * var(--ui-scale));
+}
+
+/* 上传：主按钮 + 下拉合成一个控件，工具栏只占一组宽度 */
+.sftp-upload {
+  position: relative;
+  display: flex;
+  flex: none;
+}
+
+.sftp-upload-main {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.sftp-upload-caret {
+  margin-left: -1px;
+  padding: 4px 5px;
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  line-height: 1.2;
+}
+
+/* 上传方式下拉：贴在按钮下方，宽度跟着内容，不撑破侧栏 */
+.sftp-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  min-width: 128px;
+  padding: 4px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  box-shadow: 0 6px 18px rgb(0 0 0 / 35%);
+}
+
+.sftp-menu button {
+  padding: 4px 8px;
+  background: transparent;
+  border-color: transparent;
+  border-radius: 3px;
+  text-align: left;
+  white-space: nowrap;
+  font-size: calc(11px * var(--ui-scale));
+}
+
+.sftp-menu button:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: var(--border);
+}
+
+/* 磁盘占用条：文字 + 细进度条 + 水位词，颜色只是辅助，不只靠颜色传达 */
+.sftp-disk {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-chrome);
+  color: var(--text-dim);
+  font-size: calc(10px * var(--ui-scale));
+  overflow: hidden;
+}
+
+.sftp-disk-text {
+  flex: none;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  white-space: nowrap;
+}
+
+.sftp-disk-track {
+  flex: 1 1 auto;
+  min-width: 24px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--bg-hover);
+  overflow: hidden;
+}
+
+.sftp-disk-fill {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--accent);
+  transition: width 0.3s ease;
+}
+
+/* 75% 到 90% 用琥珀，超过 90% 用告警色；文字色与条色一起换 */
+.sftp-disk.is-high .sftp-disk-fill {
+  background: var(--warning);
+}
+
+.sftp-disk.is-critical .sftp-disk-fill {
+  background: var(--danger);
+}
+
+.sftp-disk.is-high .sftp-disk-level {
+  color: var(--warning);
+}
+
+.sftp-disk.is-critical .sftp-disk-level {
+  color: var(--danger);
+}
+
+.sftp-disk-level {
+  flex: none;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+/* 低水位不额外上色，文字已经是正常状态，避免整行花掉 */
+.sftp-disk.is-normal .sftp-disk-level {
+  display: none;
+}
+
+/* 降级说明只有一行，正常环境不出现 */
+.sftp-note {
+  margin: 4px 10px 0;
+  color: var(--text-dim);
+  font-size: calc(10px * var(--ui-scale));
+  line-height: 1.5;
+}
+
+/* 拖放覆盖层：整块盖住面板，说明松手会落到哪个远端目录；不挡鼠标事件 */
+.sftp-drop {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 12px;
+  background: var(--bg-panel);
+  border: 2px dashed var(--accent);
+  border-radius: 4px;
+  color: var(--text);
+  text-align: center;
+  pointer-events: none;
+  /* 半透明但不依赖 color-mix：老内核也认这条 */
+  opacity: 0.96;
+}
+
+.sftp-drop-title {
+  font-size: calc(12px * var(--ui-scale));
+  font-weight: 600;
+}
+
+.sftp-drop-path {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--accent);
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: calc(11px * var(--ui-scale));
+}
+
+.sftp-drop-hint {
+  color: var(--text-dim);
+  font-size: calc(10px * var(--ui-scale));
+}
+
+.sftp-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px 10px 12px;
+}
+
+.sftp-hint {
+  margin: 6px 0;
+  color: var(--text-dim);
+  font-size: calc(12px * var(--ui-scale));
+}
+
+.sftp-error {
+  margin: 6px 0;
+  color: var(--danger);
+  font-size: calc(12px * var(--ui-scale));
+}
+
+/* 读取目录失败时就地提供「回到默认目录」，免得用户只能手输路径 */
+.sftp-error-action {
+  margin-left: 8px;
+  padding: 2px 8px;
+}
+
+.sftp-notice {
+  margin: 0 0 8px;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-hover);
+  color: var(--text-soft);
+  font-size: calc(12px * var(--ui-scale));
+}
+
+/* 文件表：名称列吃掉剩余宽度，长名字省略，完整名放在 title 里 */
+.sftp-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: calc(12px * var(--ui-scale));
+}
+
+.sftp-table th {
+  padding: 4px 6px;
+  text-align: left;
+  font-weight: 600;
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--border-strong);
+}
+
+.sftp-table td {
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--border);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sftp-table tbody tr:hover {
+  background: var(--bg-hover);
+}
+
+.sftp-table .sftp-name {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+.sftp-table .sftp-size {
+  width: 88px;
+  text-align: right;
+  color: var(--text-dim);
+}
+
+.sftp-table .sftp-time {
+  width: 150px;
+  color: var(--text-dim);
+}
+
+.sftp-table .sftp-actions {
+  width: 246px;
+  text-align: right;
+}
+
+.sftp-table .sftp-actions button {
+  margin-left: 4px;
+  padding: 2px 8px;
+  font-size: calc(11px * var(--ui-scale));
+}
+
+/* 侧栏窄于 360px 时只留名称列，行操作收进「⋯」-> 不出现横向滚动条 */
+.sftp-table.is-narrow .sftp-actions {
+  width: 36px;
+}
+
+.sftp-table.is-narrow .sftp-name {
+  width: auto;
+  min-width: 0;
+}
+
+.sftp-table .sftp-more {
+  margin-left: 4px;
+  padding: 1px 7px;
+  font-size: calc(12px * var(--ui-scale));
+  line-height: 1.2;
+}
+
+.sftp-table tr.is-open {
+  background: var(--bg-hover);
+}
+
+/* 展开的操作行：按钮横向放不下就换行，始终留在可视宽度内 */
+.sftp-table .sftp-action-cell {
+  padding: 4px 6px 6px;
+}
+
+.sftp-action-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.sftp-action-list button {
+  padding: 2px 8px;
+  font-size: calc(11px * var(--ui-scale));
+}
+
+/* 落在侧栏里：按钮多，窄宽时换行，路径独占一行 -> 不出现横向滚动条 */
+.sidebar .sftp-toolbar {
+  flex-wrap: wrap;
+}
+
+.sidebar .sftp-toolbar .sftp-path {
+  flex: 1 1 100%;
+  order: -1;
+}
+
+.sftp-editor {
+  width: 100%;
+  height: 46vh;
+  padding: 8px;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: calc(12px * var(--ui-scale));
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  resize: vertical;
+}
+
+.sftp-editor:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* 编辑器标题是远端完整路径，过长时省略，不撑破弹窗 */
+.sftp-editor-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: calc(12px * var(--ui-scale));
+}
+
+/* ---------- 端口转发（隧道） ---------- */
+
+/* 列表比常规弹窗高，适当放宽滚动区域 */
+.tunnel-body {
+  max-height: 68vh;
+}
+
+/* 表单字段少，比列表矮一点 */
+.tunnel-form-body {
+  max-height: 62vh;
+}
+
+/* 顶部工具栏：左边一句计数，右边按钮组；始终同一行，不换行 */
+.tunnel-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: nowrap;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+/* 计数文案过长时省略，把横向空间让给右侧按钮组 */
+.tunnel-toolbar-count {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-dim);
+  font-size: calc(11px * var(--ui-scale));
+}
+
+.tunnel-toolbar-actions {
+  display: flex;
+  gap: 6px;
+  flex: none;
+}
+
+/* 单行提示条：错误与成功共用一块位置，只换配色 */
+.tunnel-banner {
+  margin: 0 0 10px;
+  padding: 6px 9px;
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-radius: 4px;
+  font-size: calc(12px * var(--ui-scale));
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.tunnel-banner.is-error {
+  color: var(--danger);
+  background: var(--danger-bg);
+  border-color: var(--danger-border);
+  border-left-color: var(--danger);
+}
+
+.tunnel-banner.is-info {
+  color: var(--text-soft);
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
+  border-left-color: var(--accent);
+}
+
+/* 隧道弹窗列多，比常规弹窗宽；超窄窗口下退化为 92vw 且表格内部横向滚动 */
+.tunnel-dialog {
+  max-width: min(1080px, 92vw);
+}
+
+.tunnel-table-scroll {
+  width: 100%;
+  overflow-x: auto;
+}
+
+/* 表格沿用已知主机表的密度，只是列更多。
+   min-width 等于下方各列宽度之和：低于此宽度由外层横向滚动接住，
+   列与列之间不再互相挤压，名称列永远拿得到 200px（约 32 个字符）以上 */
+.tunnel-table {
+  width: 100%;
+  min-width: 880px;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: calc(12px * var(--ui-scale));
+}
+
+/* 列宽一律按 border-box 算：px 定宽列与百分比名称列才能精确相加、不超 100% */
+.tunnel-table th,
+.tunnel-table td {
+  box-sizing: border-box;
+}
+
+.tunnel-table th {
+  padding: 4px 6px;
+  text-align: left;
+  font-weight: 600;
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--border-strong);
+}
+
+.tunnel-table td {
+  padding: 6px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+
+.tunnel-table tbody tr:hover {
+  background: var(--bg-hover);
+}
+
+/* 配置已删除但仍在跑的孤儿行：压暗提示只能停止 */
+.tunnel-table tbody tr.is-orphan .tunnel-name,
+.tunnel-table tbody tr.is-orphan .tunnel-col-listen,
+.tunnel-table tbody tr.is-orphan .tunnel-col-target {
+  color: var(--text-faint);
+}
+
+/* 列宽：定宽列合计 680px（状态 92 + 类型 60 + 监听 172 + 目标 164 + 操作 192），
+   名称列吃掉剩余宽度。每个定宽列都够放本列最长文案（含「启动中…」这种过渡态）。 */
+.tunnel-col-state {
+  width: 92px;
+}
+
+.tunnel-col-kind {
+  width: 60px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+/* 名称列用 calc 显式吃掉剩余宽度，不用 width: auto。
+   原因：table-layout: fixed 下 auto 列靠「剩余宽度」分配，WebKit（Tauri 窗口用的引擎）
+   在容器偏窄、表格被 min-width 撑开时会把这份剩余算成 0，名称就只剩内边距、
+   被压成一两个字。calc 让名称列 = 表格宽度 - 定宽列之和，任何引擎结果一致。
+   名字超长时按 ellipsis 截断，全名由该单元格内 span 的 title 属性悬浮补全。 */
+.tunnel-col-name {
+  width: calc(100% - 680px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tunnel-col-listen,
+.tunnel-col-target {
+  width: 172px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: calc(11px * var(--ui-scale));
+}
+
+.tunnel-col-target {
+  width: 164px;
+  color: var(--text-soft);
+}
+
+/* 操作列定宽：三个按钮横向排布，不换行、不被压缩 */
+.tunnel-col-actions {
+  width: 192px;
+}
+
+/* 状态：圆点 + 文案，过渡态用脉冲动效（减少动效时全局降级） */
+.tunnel-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: calc(11px * var(--ui-scale));
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.tunnel-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-faint);
+}
+
+.tunnel-dot.is-running {
+  background: var(--proto-ssh);
+  /* 发光只用主题变量，不依赖 color-mix（与项目其它半透明写法一致） */
+  box-shadow: 0 0 5px var(--proto-ssh);
+}
+
+.tunnel-dot.is-pending {
+  background: var(--warning);
+  animation: tunnel-dot-pulse 1s ease-in-out infinite;
+}
+
+@keyframes tunnel-dot-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.tunnel-name {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tunnel-row-actions {
+  display: flex;
+  flex-wrap: nowrap;
+  justify-content: flex-end;
+  gap: 4px;
+}
+
+.tunnel-row-actions button {
+  flex: none;
+  padding: 2px 8px;
+  font-size: calc(11px * var(--ui-scale));
+  white-space: nowrap;
+}
+
+/* 行内按钮按语义分色：启动=强调(accent)、停止=警示(warning)、编辑=中性(默认)、
+   删除=危险(danger，见 button.danger)。同一位置只会出现启动或停止，不会并列。
+   颜色只改文字与描边，不动 padding/字号 -> 行高与布局不变；
+   禁用态交给全局 button:disabled 的透明度，配色不额外上浮，避免看起来还能点 */
+.tunnel-row-actions button.is-start {
+  color: var(--accent);
+  border-color: var(--accent-line);
+}
+
+.tunnel-row-actions button.is-stop {
+  color: var(--warning);
+  border-color: var(--warning);
+}
+
+/* 通用 button:hover 会把描边改回中性灰 -> 这两类 hover 保持自己的颜色 */
+.tunnel-row-actions button.is-start:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.tunnel-row-actions button.is-stop:hover:not(:disabled) {
+  border-color: var(--warning);
+  background: var(--btn-hover);
+}
+
+/* 空态：居中提示 + 引导按钮 */
+.tunnel-empty {
+  padding: 40px 0;
+  text-align: center;
+  color: var(--text-dim);
+}
+
+.tunnel-empty p {
+  margin: 0 0 12px;
+  font-size: calc(12px * var(--ui-scale));
+}
+
+/* 字段级校验错误：紧贴对应输入框下方，左侧缩进对齐输入列 */
+p.setting-error {
+  margin: -4px 0 8px 138px;
+  color: var(--danger);
+  font-size: calc(11px * var(--ui-scale));
+}
+
+/* 说明文字单独成段时要收掉浏览器默认外边距，避免分组被撑开 */
+p.setting-note {
+  margin: 0 0 8px;
+}
+
+/* ---------- 响应式与动效降级 ---------- */
+
+/* 窄窗口：侧栏收窄，主内容留给终端 */
+@media (max-width: 1100px) {
+  .tab-subtitle {
+    display: none;
+  }
+}
+
+/* 跟随系统「减少动效」-> 过渡只保留一帧，不做动画 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    transition-delay: 0ms !important;
+  }
+}
+
+/* ---------- 首选项弹窗 ---------- */
+
+.settings-dialog .dialog-body {
+  padding-bottom: 6px;
+}
+
+/* 分段选择：按钮始终带 1px 边框（透明），选中只换颜色不换尺寸 -> hover 不抖 */
+.segmented {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--bg-input);
+}
+
+.segmented-button {
+  border: 1px solid transparent;
+  background: transparent;
+  padding: 3px 10px;
+  border-radius: 3px;
+  color: var(--text-dim);
+  font-size: calc(11px * var(--ui-scale));
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+.segmented-button:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: transparent;
+  color: var(--text);
+}
+
+.segmented-button.is-active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+}
+
+.segmented-button.is-active:hover:not(:disabled) {
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+.scale-control {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* 步进器：加减按钮定宽，数值用等宽数字 -> 数字变化时整行不跳 */
+.stepper {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+
+.stepper-button {
+  width: 24px;
+  padding: 2px 0;
+  text-align: center;
+  line-height: 1.4;
+}
+
+.stepper-value {
+  min-width: 54px;
+  text-align: center;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 滑块去掉输入框的框线与内边距，只留轨道与滑块 */
+.range-input {
+  flex: 1;
+  width: auto;
+  min-width: 96px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  accent-color: var(--accent);
+}
+
+.range-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.check-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-dim);
+  font-size: calc(12px * var(--ui-scale));
+  cursor: pointer;
+}
+
+.check-line input {
+  flex: none;
+}
+
+/* 终端实时预览：等宽字体与字号由行内样式给，颜色/边框跟主题变量走 */
+.term-preview {
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.35;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---------- 终端字体选择（首选项 -> 终端） ---------- */
+
+/* 候选列表比标签高，整行改成顶部对齐，标签补一点上内边距与输入框对齐 */
+.setting-row-tall {
+  align-items: start;
+}
+
+.setting-row-tall .setting-label {
+  padding-top: 5px;
+}
+
+.font-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.font-picker input {
+  font-size: calc(12px * var(--ui-scale));
+}
+
+/* 候选列表自己滚，字体再多也不撑高弹窗 */
+.font-list {
+  max-height: 168px;
+  overflow-y: auto;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-input);
+}
+
+/* 复刻 .segmented-button 的观感：默认透明，悬停浮起，选中填强调色 */
+.font-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 3px 7px;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: calc(12px * var(--ui-scale));
+  text-align: left;
+}
+
+.font-option:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: transparent;
+  color: var(--text);
+}
+
+.font-option.is-active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+}
+
+/* 选中的项被指到时也要保持强调色，不然鼠标一过就像没选中 */
+.font-option.is-active:hover:not(:disabled) {
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+/* 族名可能很长（带版本/风格后缀），单行省略，完整值放 title */
+.font-option-name {
+  flex: 1;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.font-option-tag {
+  flex: none;
+  padding: 0 4px;
+  border: 1px solid currentColor;
+  border-radius: 3px;
+  font-size: calc(10px * var(--ui-scale));
+  opacity: 0.75;
+}
+
+.font-empty {
+  margin: 0;
+  padding: 8px 7px;
+}
+
+/* 当前生效值同样单行省略，旧预设迁移过来的是整条字体栈，很长 */
+.font-current {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* 浅色主题下的图标：调色板是为暗底定的，浅底上直接看不清。   只在这里做一层压暗（不改 icons.tsx 的 5 色板），
+   压暗后蓝/绿/紫/中性色对白底都 ≥ 3:1，浅黄也能分辨。 */
+:root[data-theme="light"] .app-shell svg {
+  filter: brightness(0.62) saturate(1.05);
+}
+
+/* ---------- 主题选择（首选项 -> 外观） ---------- */
+
+/* 内置 / 自定义 / 导入三个分区共用这个滚动容器：
+   主题数量不影响弹窗高度，最多在容器内部滚动 */
+.theme-scroll {
+  max-height: 246px;
+  overflow-y: auto;
+  margin-bottom: 10px;
+  padding-right: 2px;
+}
+
+.theme-subtitle {
+  margin: 4px 0 6px;
+  font-size: calc(11px * var(--ui-scale));
+  font-weight: 600;
+  color: var(--text-soft);
+}
+
+.theme-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(148px, 1fr));
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+/* 卡片本身不是按钮：主体是里面的按钮，删除按钮单独一块 -> 键盘焦点清晰 */
+.theme-card {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-panel);
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+
+.theme-card:hover {
+  border-color: var(--border-strong);
+}
+
+.theme-card.is-active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.theme-card-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 4px 6px;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  border-radius: 4px;
+  text-align: left;
+}
+
+/* 卡片主体不需要 hover 底色：整张卡片已经有描边与背景变化 */
+.theme-card-main:hover:not(:disabled) {
+  border-color: transparent;
+  background: transparent;
+}
+
+.theme-card-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  font-size: calc(11.5px * var(--ui-scale));
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.theme-card-kind {
+  flex: none;
+  padding: 0 3px;
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  font-size: calc(9.5px * var(--ui-scale));
+  color: var(--text-dim);
+}
+
+/* 四色预览：底色 / 面板 / 强调 / 正文，一眼看出这套主题的调子 */
+.theme-swatches {
+  display: flex;
+  gap: 2px;
+}
+
+.theme-swatch {
+  width: 18px;
+  height: 10px;
+  border-radius: 2px;
+  border: 1px solid var(--border-strong);
+}
+
+.theme-delete {
+  align-self: center;
+  padding: 1px 5px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: calc(10px * var(--ui-scale));
+}
+
+.theme-delete:hover:not(:disabled) {
+  color: var(--danger);
+  border-color: var(--danger-border);
+  background: var(--danger-bg);
+}
+
+.theme-delete.is-danger {
+  color: var(--danger);
+  border-color: var(--danger-border);
+  background: var(--danger-bg);
+}
+
+/* 删除的二次确认并排竖排，不改变卡片宽度 */
+.theme-card-actions {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+}
+
+.theme-import-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+/* 导入回执与错误：错误用危险色 + 图标语义（role=alert 已由读屏播报） */
+.theme-message {
+  margin: 0 0 6px;
+  font-size: calc(11px * var(--ui-scale));
+  line-height: 1.55;
+  word-break: break-word;
+}
+
+.theme-message.is-error {
+  color: var(--danger);
+}
+
+.theme-message.is-ok {
+  color: var(--proto-ssh);
+}
+
+/* 契约帮助默认收起，展开后单独滚动 -> 不挤占主题列表 */
+.theme-help {
+  margin-bottom: 8px;
+}
+
+.theme-help summary {
+  cursor: pointer;
+  font-size: calc(11px * var(--ui-scale));
+  color: var(--text-dim);
+}
+
+.theme-help summary:hover {
+  color: var(--text);
+}
+
+.theme-help pre {
+  margin: 6px 0 0;
+  padding: 8px;
+  max-height: 172px;
+  overflow: auto;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: calc(10.5px * var(--ui-scale));
+  line-height: 1.45;
+  color: var(--text-soft);
+  white-space: pre;
+}
+
+/* 跟随系统未开启时两个配对下拉置灰，但仍然可见 */
+.settings-dialog select:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* 快捷键列表：名称 / 组合 / 录制 / 重置 四列，组合用等宽字体 */
+.shortcut-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 6px 0;
+}
+
+.shortcut-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 130px auto auto;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: calc(12px * var(--ui-scale));
+}
+
+.shortcut-row.is-conflict {
+  border-color: var(--danger);
+}
+
+.shortcut-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shortcut-combo {
+  color: var(--text-dim);
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  text-align: right;
+}
+
+.shortcut-row button {
+  padding: 2px 8px;
+  font-size: calc(11px * var(--ui-scale));
+}
+
+/* 传输进度行：独占一行、内部允许换行。
+   260 到 320px 的窄侧栏里，文件名与进度条先缩，数字与按钮整体折到下一行，
+   因此不会把上面那行工具栏挤成两排。 */
+.sftp-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 2px 4px 6px;
+  padding: 5px 7px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-sunken);
+  color: var(--text-dim);
+  font-size: calc(11px * var(--ui-scale));
+}
+
+.sftp-progress-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 文件名：可缩可省略，完整名字放 title 里 */
+.sftp-progress-name {
+  flex: 1 1 92px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+.sftp-progress-track {
+  flex: 1 1 72px;
+  min-width: 40px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--bg-hover);
+  overflow: hidden;
+}
+
+.sftp-progress-fill {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--accent);
+  transition: width 0.2s ease;
+}
+
+/* 已传 / 总量 · 百分比：等宽数字，数字变化时整行不会左右晃 */
+.sftp-progress-meta {
+  flex: 0 0 auto;
+  color: var(--text-soft);
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: calc(10px * var(--ui-scale));
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.sftp-progress-action {
+  flex: 0 0 auto;
+  padding: 1px 8px;
+  font-size: calc(11px * var(--ui-scale));
+  line-height: 1.6;
+}
+
+/* 第二行：完成数/总数、失败原因；长路径可以在任意处断行 */
+.sftp-progress-sub {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: calc(10px * var(--ui-scale));
+  overflow-wrap: anywhere;
+}
+
+.sftp-progress-sub.is-note {
+  color: var(--text-soft);
+}
+
+/* 总量未知：斜纹滚动表示「在跑但还没有分母」，此时绝不显示 0% */
+.sftp-progress.is-unknown .sftp-progress-fill {
+  width: 100%;
+  background-color: var(--accent-soft);
+  background-image: repeating-linear-gradient(
+    115deg,
+    var(--accent) 0 6px,
+    transparent 6px 12px
+  );
+  background-size: 24px 100%;
+  animation: sftp-progress-slide 1s linear infinite;
+}
+
+@keyframes sftp-progress-slide {
+  from {
+    background-position: 0 0;
+  }
+  to {
+    background-position: 24px 0;
+  }
+}
+
+/* 跟随系统「减少动效」：斜纹留在原地，仍然一眼看出是不确定态 */
+@media (prefers-reduced-motion: reduce) {
+  .sftp-progress.is-unknown .sftp-progress-fill {
+    animation: none;
+    background-position: 0 0;
+  }
+}
+
+/* 取消中：条子转琥珀，按钮在位但禁用，点下去立刻有反馈 */
+.sftp-progress.is-cancelling .sftp-progress-fill {
+  background: var(--warning);
+}
+
+.sftp-progress.is-cancelling .sftp-progress-action {
+  cursor: progress;
+}
+
+.sftp-progress.is-cancelled .sftp-progress-meta,
+.sftp-progress.is-cancelled .sftp-progress-sub {
+  color: var(--warning);
+}
+
+/* 失败：边框与数字一起转告警色，同时给出文字原因，不只靠颜色 */
+.sftp-progress.is-error {
+  border-color: var(--danger-border);
+  background: var(--danger-bg);
+}
+
+.sftp-progress.is-error .sftp-progress-fill {
+  background: var(--danger);
+}
+
+.sftp-progress.is-error .sftp-progress-meta,
+.sftp-progress.is-error .sftp-progress-sub {
+  color: var(--danger);
+}
+
+.sftp-progress.is-error .sftp-progress-action {
+  color: var(--danger);
+  border-color: var(--danger-border);
+}
+
+/* ---------- 命令面板 ---------- */
+
+/* 外壳复用 .modal（底色/边框/圆角/560px 宽），这里只补自己的排版：
+   高度收得更紧，内部两段（输入框 + 列表）自己分配空间，不要整面板一起滚 */
+.palette {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 70vh;
+  overflow: hidden;
+  padding: 12px;
+}
+
+/* 输入框独占顶部整行，字号比列表大一号，看起来像搜索框而不是表单字段 */
+.palette .palette-input {
+  flex: none;
+  font-size: calc(15px * var(--ui-scale));
+  padding: 7px 9px;
+}
+
+/* 列表自己滚：约 12 条之后出现滚动条，再多也撑不高面板 */
+.palette-list {
+  flex: 1;
+  min-height: 0;
+  max-height: calc(336px * var(--ui-scale));
+  overflow-y: auto;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-input);
+}
+
+/* 与 .font-option 同一套观感：默认透明，悬停浮起，选中压上 --bg-active + 强调色描边 */
+.palette-option {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 5px 8px;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text);
+  font-size: calc(12px * var(--ui-scale));
+  text-align: left;
+}
+
+.palette-option:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: transparent;
+}
+
+.palette-option.is-active {
+  background: var(--bg-active);
+  border-color: var(--accent);
+}
+
+/* 选中项被指到时也要留住强调色，否则鼠标一过就像没选中 */
+.palette-option.is-active:hover:not(:disabled) {
+  background: var(--bg-active);
+  border-color: var(--accent);
+}
+
+/* 中文标题为主、英文标题为副，同一行；两边都可能很长，各自省略 */
+.palette-option-titles {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+
+.palette-option-title {
+  flex: none;
+  max-width: 60%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: calc(13px * var(--ui-scale));
+}
+
+.palette-option-title-en {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--text-dim);
+  font-size: calc(11px * var(--ui-scale));
+}
+
+.palette-option-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  color: var(--text-dim);
+  font-size: calc(11px * var(--ui-scale));
+}
+
+.palette-option-group {
+  flex: none;
+  padding: 0 4px;
+  border: 1px solid currentColor;
+  border-radius: 3px;
+  opacity: 0.75;
+}
+
+/* 提示可能是「Ctrl+Shift+A」这类键位，用等宽字避免加号两侧跳动 */
+.palette-option-hint {
+  flex: none;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: calc(10px * var(--ui-scale));
+}
+
+.palette-empty {
+  margin: 0;
+  padding: 10px 8px;
+  color: var(--text-dim);
+  font-size: calc(12px * var(--ui-scale));
+}

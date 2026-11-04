@@ -1,0 +1,28 @@
+[package]
+name = "rustmobax"
+description = "Desktop shell for RustMobaX: Tauri commands over rustmobax-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "rustmobax_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-window-state = "2"
+rustmobax-core = { path = "../crates/core" }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+base64.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread"] }
