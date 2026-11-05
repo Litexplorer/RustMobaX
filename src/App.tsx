@@ -408,9 +408,25 @@ function App() {
    * 只服务于「焦点切换」与活动态高亮，不参与建连；单屏时恒为 0。
    */
   const [activePaneIndex, setActivePaneIndex] = useState<0 | 1>(0);
+  /**
+   * 用户显式请求聚焦哪一块分屏：0 左 / 1 右，null 表示没有待处理请求。
+   *
+   * 只有快捷键与命令面板会写它，由下面的 effect 消费后立刻置回 null。不在这里直接
+   * 调 ref.focus() 是因为时机：同一帧里 setState 还没落到 DOM，ref 可能仍指向旧节点；
+   * effect 保证在提交之后才跑。置回 null 让「重复按同一个键」也能再次生效（值从 null
+   * 变回 0 才算一次变化），严格模式下 effect 跑两遍同样幂等。
+   */
+  const [pendingFocusPane, setPendingFocusPane] = useState<0 | 1 | null>(null);
   /** 两块分屏面板的句柄，用于把键盘焦点交进去（不改 key -> xterm 不重建） */
   const leftPaneRef = useRef<{ focus: () => void } | null>(null);
   const rightPaneRef = useRef<{ focus: () => void } | null>(null);
+  /**
+   * 上一次「活动标签 + 是否分屏」的快照，用来判断终端显示面是不是刚换过。
+   *
+   * 补焦点的 effect 依赖里还带着 activePaneIndex（鼠标点 pane 会让它变），
+   * 靠这份快照区分「真的换了显示面」和「只是点了下另一块 pane」。
+   */
+  const focusTargetRef = useRef<{ tab: string | null; split: boolean }>({ tab: null, split: false });
   const [dialog, setDialog] = useState<DialogState>({ kind: "none" });
   /** 命令面板是否展开；面板自身在 open=false 时整棵子树不渲染 */
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -2626,20 +2642,58 @@ function App() {
   };
 
   /**
-   * 把键盘焦点移到分屏的某一块。
+   * 请求把键盘焦点移到分屏的某一块。
    *
    * 参数：index 为 0 左 / 1 右
-   * 核心流程：先更新活动索引（样式立刻跟手），再等一帧把焦点交给对应面板的
-   * xterm —— 同一帧内 setState 还没落到 DOM，直接 focus 会因为面板仍是隐藏/旧的
-   * 那一块而丢焦点。useCallback 稳定引用，快捷键 effect 的依赖数组才不会被它拖着重跑。
+   * 核心流程：只更新活动索引（样式立刻跟手）并登记「待聚焦目标」，真正的 focus()
+   * 交给下面的 effect —— 它在 DOM 提交之后才跑，ref 一定已经指向新节点；早期版本
+   * 用 requestAnimationFrame 兜，但 rAF 与 React 的提交顺序没有保证，切标签那一瞬间
+   * ref 会被置空，rAF 里的 focus() 就变成空操作。useCallback 稳定引用，快捷键 effect
+   * 的依赖数组才不会被它拖着重跑。
    */
   const focusPane = useCallback((index: 0 | 1) => {
     setActivePaneIndex(index);
-    requestAnimationFrame(() => {
-      const target = index === 0 ? leftPaneRef : rightPaneRef;
-      target.current?.focus();
-    });
+    setPendingFocusPane(index);
   }, []);
+
+  /**
+   * 消费「待聚焦目标」。
+   *
+   * 参数：无（读 pendingFocusPane 与两块分屏的 ref）
+   * 核心流程：有请求才动手 -> 未分屏直接丢弃、ref 为空静默跳过 -> 用完立刻置回 null。
+   * 用 effect 而不是 rAF 的原因见 focusPane 的注释；置回 null 保证同一个键重复按
+   * 也能再次触发（值必须变化 effect 才会重跑），严格模式重跑两遍同样幂等。
+   */
+  useEffect(() => {
+    if (pendingFocusPane === null) return;
+    setPendingFocusPane(null);
+    // 未分屏时不做任何 focus：单屏下焦点本来就该留在用户正在操作的地方
+    if (!activeSplit) return;
+    const target = pendingFocusPane === 0 ? leftPaneRef : rightPaneRef;
+    target.current?.focus();
+  }, [pendingFocusPane, activeSplit]);
+
+  /**
+   * 终端显示面换了以后，把焦点补回去。
+   *
+   * 参数：无（读 activeTabId / activeSplit / activePaneIndex）
+   * 核心流程：只在两种「用户确实换了显示面」的时刻动手：
+   *   1. 标签真的换了 —— 非活动标签靠 .tab-pane.is-hidden（display:none）藏着，
+   *      浏览器会把焦点从被隐藏的 xterm textarea 上收回 body，于是 Alt+Left/Right
+   *      切完标签直接打字一个字都进不去；
+   *   2. 分屏被收起 —— 右面板整块卸载，焦点同样掉到 body。
+   * 其它情况（鼠标点 pane 改 activePaneIndex、展开分屏）一律不动，避免抢焦点。
+   * SFTP 标签没有终端句柄（ref 为 null）-> 静默跳过。
+   */
+  useEffect(() => {
+    const previous = focusTargetRef.current;
+    focusTargetRef.current = { tab: activeTabId, split: activeSplit };
+    const tabChanged = activeTabId !== null && previous.tab !== activeTabId;
+    const splitCollapsed = previous.split && !activeSplit;
+    if (!tabChanged && !splitCollapsed) return;
+    const target = activeSplit && activePaneIndex === 1 ? rightPaneRef : leftPaneRef;
+    target.current?.focus();
+  }, [activeTabId, activeSplit, activePaneIndex]);
 
   /**
    * 全局快捷键分发。

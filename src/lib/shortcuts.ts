@@ -60,10 +60,12 @@ export const DEFAULT_SHORTCUTS: ShortcutMap = {
   settings: "Ctrl+,",
   prevTab: "Alt+Left",
   nextTab: "Alt+Right",
-  // 与标签切换（Alt+Left/Right）共用方向键，多一个 Shift 区分：
+  // 与标签切换（Alt+Left/Right）分开，免得抢同一组方向键。
+  // 不用 Alt+Shift+Left/Right：Windows 上 Alt+Shift 是输入法/键盘布局切换的系统热键，
+  // 会被系统先消费，应用根本收不到 keydown（表现为「按了没反应、焦点没进终端」）。
   // normalizeCombo 会把 ArrowLeft/ArrowRight 归一成 Left/Right，这里直接写短名
-  prevPane: "Alt+Shift+Left",
-  nextPane: "Alt+Shift+Right",
+  prevPane: "Ctrl+Shift+Left",
+  nextPane: "Ctrl+Shift+Right",
   multiExec: "Ctrl+Shift+M",
 };
 
