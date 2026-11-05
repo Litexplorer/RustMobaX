@@ -15,7 +15,12 @@ export type ShortcutActionId =
   | "split"
   | "toggleSidebar"
   | "commandPalette"
-  | "settings";
+  | "settings"
+  | "prevTab"
+  | "nextTab"
+  | "prevPane"
+  | "nextPane"
+  | "multiExec";
 
 /** 动作 id 到组合的映射 */
 export type ShortcutMap = Record<ShortcutActionId, string>;
@@ -31,6 +36,15 @@ export const SHORTCUT_ACTIONS: { id: ShortcutActionId; label: string; hint: stri
   { id: "toggleSidebar", label: "显示/隐藏侧栏", hint: "收起或展开左侧栏" },
   { id: "commandPalette", label: "命令面板", hint: "打开命令面板" },
   { id: "settings", label: "首选项", hint: "打开设置弹窗" },
+  { id: "prevTab", label: "上一个标签", hint: "切换到左侧标签" },
+  { id: "nextTab", label: "下一个标签", hint: "切换到右侧标签" },
+  { id: "prevPane", label: "焦点到左侧分屏", hint: "分屏时把输入焦点移到左边那块" },
+  { id: "nextPane", label: "焦点到右侧分屏", hint: "分屏时把输入焦点移到右边那块" },
+  {
+    id: "multiExec",
+    label: "多执行",
+    hint: "展开底部广播输入条，一条命令发往多个会话",
+  },
 ];
 
 /** 默认键位：与管理器里「恢复默认」共用 */
@@ -44,6 +58,13 @@ export const DEFAULT_SHORTCUTS: ShortcutMap = {
   toggleSidebar: "Ctrl+B",
   commandPalette: "Ctrl+Shift+A",
   settings: "Ctrl+,",
+  prevTab: "Alt+Left",
+  nextTab: "Alt+Right",
+  // 与标签切换（Alt+Left/Right）共用方向键，多一个 Shift 区分：
+  // normalizeCombo 会把 ArrowLeft/ArrowRight 归一成 Left/Right，这里直接写短名
+  prevPane: "Alt+Shift+Left",
+  nextPane: "Alt+Shift+Right",
+  multiExec: "Ctrl+Shift+M",
 };
 
 /** 只按下修饰键时不算组合 */

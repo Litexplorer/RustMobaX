@@ -442,6 +442,157 @@ select:focus-visible,
   outline-offset: 1px;
 }
 
+/* ---------- 多执行（会话主区底部广播输入条） ---------- */
+
+/* 外壳仿状态栏：贴底、不参与伸缩，纵向三段（标题 / 目标 / 输入）。
+   flex: none 保证它不会把上面的终端挤扁，也不会被终端挤掉 */
+.multiexec-bar {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 6px 10px;
+  background: var(--bg-chrome);
+  border-top: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: calc(11px * var(--ui-scale));
+}
+
+.multiexec-head,
+.multiexec-targets,
+.multiexec-input-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.multiexec-icon {
+  display: flex;
+  color: var(--text-dim);
+}
+
+.multiexec-title {
+  flex: none;
+  color: var(--text);
+}
+
+.multiexec-count {
+  flex: none;
+  margin-left: auto;
+  color: var(--text-faint);
+}
+
+/* 标题行右侧的小按钮：比通用按钮矮一档，不撑高整条 */
+.multiexec-btn {
+  flex: none;
+  padding: 0 6px;
+  font-size: calc(10px * var(--ui-scale));
+  line-height: 1.6;
+}
+
+.multiexec-close {
+  padding: 0 5px;
+  font-size: calc(12px * var(--ui-scale));
+}
+
+/* 目标行横向滚动：会话再多也不换行、不撑高 */
+.multiexec-targets {
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  padding-bottom: 1px;
+}
+
+.multiexec-empty {
+  color: var(--text-faint);
+  font-size: calc(10px * var(--ui-scale));
+}
+
+/* 目标胶囊：两态宽度恒定（边框常驻、只有颜色变化），选中＝强调色，未选中＝灰色描边 */
+.multiexec-tag {
+  flex: none;
+  padding: 1px 6px;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  font-size: calc(10px * var(--ui-scale));
+  line-height: 1.4;
+  white-space: nowrap;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.multiexec-tag.is-on {
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
+  color: var(--accent);
+}
+
+/* 通用 button:hover 会把配色改回中性灰 -> 两态各自守住自己的颜色 */
+.multiexec-tag.is-on:hover:not(:disabled) {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.multiexec-tag.is-off {
+  background: transparent;
+  border-color: var(--border-strong);
+  color: var(--text-faint);
+}
+
+.multiexec-tag.is-off:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: var(--border-strong);
+  color: var(--text-dim);
+}
+
+/* 输入行仿左栏的搜索框：外层给描边，内层 input 去边框去背景 */
+.multiexec-input-row {
+  gap: 6px;
+  padding: 0 8px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+
+.multiexec-input-row:focus-within {
+  border-color: var(--accent);
+}
+
+.multiexec-input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 0;
+  border: none;
+  background: transparent;
+}
+
+/* 发送结果与未选提示：状态行常驻在输入行右侧，不额外占高度 */
+.multiexec-status {
+  flex: none;
+  font-size: calc(10px * var(--ui-scale));
+  white-space: nowrap;
+  color: var(--text-faint);
+}
+
+.multiexec-status.is-ok {
+  color: var(--text-dim);
+}
+
+.multiexec-status.is-warn {
+  color: var(--text-faint);
+}
+
+.multiexec-status.is-error {
+  color: var(--danger-soft);
+}
+
+.multiexec-send {
+  flex: none;
+  padding: 2px 10px;
+  font-size: calc(11px * var(--ui-scale));
+}
+
 /* ---------- 远程监控（会话主区底部） ---------- */
 
 .monitor-panel {
@@ -1322,6 +1473,20 @@ body.is-resizing-sidebar * {
 
 .terminal-pane + .terminal-pane {
   border-left: 1px solid var(--border);
+}
+
+/*
+ * 分屏活动态：用 box-shadow 而不是 border —— 改 border 会改变盒子尺寸，
+ * 触发 xterm 的 ResizeObserver 重新 fit，终端会出现行列抖动。
+ * 只在 .terminal-split 里的 .is-active 上生效，单屏时没有这个类，不会出现任何描边。
+ * 左块描左边（inset 2px 0），右块描右边（inset -2px 0），两块都能看出方向。
+ */
+.terminal-split .terminal-pane.is-active {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.terminal-split .terminal-pane.is-active:last-child {
+  box-shadow: inset -2px 0 0 var(--accent);
 }
 
 .terminal-overlay {

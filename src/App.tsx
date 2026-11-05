@@ -22,7 +22,7 @@ import type { ThemePalette } from "./lib/themes";
 import type { SidebarTab } from "./api/settings";
 import { paletteFromRecord } from "./lib/themeImport";
 import { isRemoteDesktop, isSshLike, isTerminalProtocol } from "./lib/protocols";
-import { trustHostKey, forgetHostKey } from "./api/terminal";
+import { textToBase64, writeLocalTerminal, trustHostKey, forgetHostKey } from "./api/terminal";
 import type { HostKeyInfo, SshAuthRequest } from "./api/terminal";
 import { launchRemoteDesktop, remoteDesktopClients } from "./api/remoteDesktop";
 import type { RemoteDesktopClient } from "./api/remoteDesktop";
@@ -66,6 +66,8 @@ import { CommandPalette } from "./components/CommandPalette";
 import { tunnelConfigList, tunnelList, tunnelStart } from "./api/tunnel";
 import type { TunnelConfig, TunnelInfo } from "./api/tunnel";
 import { TerminalPanel } from "./components/TerminalPanel";
+import { MultiExecBar } from "./components/MultiExecBar";
+import type { MultiExecTarget } from "./components/MultiExecBar";
 import { SftpPanel } from "./components/SftpPanel";
 import { formatMemory, formatRate, remoteMetrics, shortenAddress, systemMetrics } from "./api/metrics";
 import { remoteDisk } from "./api/sftp";
@@ -90,6 +92,7 @@ import {
   IconImport,
   IconInfo,
   IconKey,
+  IconMultiExec,
   IconSearch,
   IconServer,
   IconSessions,
@@ -399,6 +402,15 @@ function App() {
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
   /** 处于左右分屏的标签，最多两块面板 */
   const [splitTabIds, setSplitTabIds] = useState<string[]>([]);
+  /**
+   * 分屏里当前拿到键盘焦点的哪一块：0 左、1 右。
+   *
+   * 只服务于「焦点切换」与活动态高亮，不参与建连；单屏时恒为 0。
+   */
+  const [activePaneIndex, setActivePaneIndex] = useState<0 | 1>(0);
+  /** 两块分屏面板的句柄，用于把键盘焦点交进去（不改 key -> xterm 不重建） */
+  const leftPaneRef = useRef<{ focus: () => void } | null>(null);
+  const rightPaneRef = useRef<{ focus: () => void } | null>(null);
   const [dialog, setDialog] = useState<DialogState>({ kind: "none" });
   /** 命令面板是否展开；面板自身在 open=false 时整棵子树不渲染 */
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -488,6 +500,22 @@ function App() {
   /** 指标：优先取当前活动 SSH 会话的远端主机，没有远端会话时才采本机 */
   /** 会话 id -> 后端终端注册表里的终端 id（远端指标要用它查底层 SSH 连接） */
   const [terminalIds, setTerminalIds] = useState<Record<string, string>>({});
+  /** 会话 id -> 该会话当前所有活动终端 id（分屏时一个会话有两块终端，terminalIds 只记得最后一块） */
+  const [terminalIdList, setTerminalIdList] = useState<Record<string, string[]>>({});
+  /**
+   * terminalIdList 的同步镜像。
+   *
+   * 为什么需要：handleTerminalId 要在两个 setState 之间共享「该会话还剩哪些
+   * terminalId」，而 React 执行 updater 的顺序不保证与 dispatch 顺序一致，
+   * 用闭包局部变量传递会让先执行的那个 updater 读到还没赋值的空数组。
+   * 因此改为在 handler 里同步算完写进 ref，两个 setState 只消费这份结果；
+   * 所有写 terminalIdList 的地方都必须同步写这个 ref。
+   */
+  const terminalIdListRef = useRef<Record<string, string[]>>({});
+  /** 底部「多执行」输入条是否展开（只记在内存里，不持久化） */
+  const [multiExecOpen, setMultiExecOpen] = useState(false);
+  /** 多执行时被勾选的会话 id 集合 */
+  const [multiExecTargets, setMultiExecTargets] = useState<string[]>([]);
   /** 活动远端会话的磁盘占用（单独 10 秒节流），null 表示取不到 -> 界面显示「—」 */
   const [disk, setDisk] = useState<RemoteDisk | null>(null);
 
@@ -724,7 +752,14 @@ function App() {
   useEffect(() => {
     setOpenTabIds((prev) => prev.filter((id) => sessions.some((item) => item.id === id)));
     setSplitTabIds((prev) => prev.filter((id) => sessions.some((item) => item.id === id)));
+    // 分屏列表可能少了一条 -> 焦点索引一起归零，别留给已经不存在的右块
+    setActivePaneIndex(0);
   }, [sessions]);
+
+  // 切标签后焦点回到左块：右块可能是新挂载的，旧索引留着会指到看不见的面板上
+  useEffect(() => {
+    setActivePaneIndex(0);
+  }, [activeTabId]);
 
   /**
    * 记录分组折叠状态。
@@ -1049,6 +1084,7 @@ function App() {
    */
   const closeTab = (id: string) => {
     setSplitTabIds((prev) => prev.filter((item) => item !== id));
+    setActivePaneIndex(0);
     setOpenTabIds((prev) => {
       const next = prev.filter((item) => item !== id);
       if (activeTabId === id) {
@@ -1071,6 +1107,8 @@ function App() {
     setSplitTabIds((prev) =>
       prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id],
     );
+    // 收起分屏（以及重新分屏）都把焦点索引归零：右块要么没了，要么是刚建的
+    setActivePaneIndex(0);
   };
 
   /**
@@ -1805,16 +1843,51 @@ function App() {
    */
   const handleTerminalId = useCallback(
     (sessionId: string, terminalId: string | null, expectedId?: string) => {
+      // 先把当前快照读出来（ref 与 state 同步维护，不依赖 updater 执行顺序）。
+      // 同一个会话分屏时右侧 pane 通常是后注册的那个，它退出后左块不会重新上报，
+      // 所以不能直接把 terminalIds[sessionId] 删掉，否则远程监控/SFTP 会一直停在 null。
+      const snapshot = terminalIdListRef.current;
+      const currentIds = snapshot[sessionId] ?? [];
+      const remaining =
+        terminalId === null
+          ? expectedId === undefined
+            ? []
+            : currentIds.filter((id) => id !== expectedId)
+          : currentIds.includes(terminalId)
+            ? currentIds
+            : [...currentIds, terminalId];
+
+      // 先算出新快照并同步写回 ref：ref 是唯一的事实来源，两个 setState 只消费
+      // 上面同步算好的结果，绝不再跨 updater 传递变量
+      const nextSnapshot = { ...snapshot };
+      if (remaining.length === 0) delete nextSnapshot[sessionId];
+      else nextSnapshot[sessionId] = remaining;
+      // 内容没变就不 setState（重复上报很常见），避免无意义重渲染
+      const listChanged =
+        remaining.length === 0 ? sessionId in snapshot : snapshot[sessionId] !== remaining;
+      if (listChanged) {
+        terminalIdListRef.current = nextSnapshot;
+        // 同步维护「一个会话的全部终端」：分屏时同会话两块终端都要能收到广播，
+        // 只记最后一个的 terminalIds 不够用，这里额外按会话存数组
+        setTerminalIdList(nextSnapshot);
+      }
+
       setTerminalIds((prev) => {
-        if (terminalId === null) {
-          if (!(sessionId in prev)) return prev;
-          if (expectedId !== undefined && prev[sessionId] !== expectedId) return prev;
-          const next = { ...prev };
-          delete next[sessionId];
-          return next;
+        if (terminalId !== null) {
+          if (prev[sessionId] === terminalId) return prev;
+          return { ...prev, [sessionId]: terminalId };
         }
-        if (prev[sessionId] === terminalId) return prev;
-        return { ...prev, [sessionId]: terminalId };
+        // 守卫：注销的不是自己注册的那个 id 就不动（另一块面板可能已经接管）
+        if (expectedId !== undefined && prev[sessionId] !== expectedId) return prev;
+        // 同会话还有别的终端活着 -> 回填成剩下那个，而不是把整个会话删掉，
+        // 否则 activeTerminalId 变 null，远程监控面板会整块被摘掉
+        if (remaining.length > 0) {
+          return { ...prev, [sessionId]: remaining[remaining.length - 1] };
+        }
+        if (!(sessionId in prev)) return prev;
+        const next = { ...prev };
+        delete next[sessionId];
+        return next;
       });
     },
     [],
@@ -2013,6 +2086,85 @@ function App() {
   // 分屏只服务终端，SFTP 面板不做左右分屏
   const activeHasTerminal = activeSession !== null && isTerminalProtocol(activeSession.protocol);
   const activeSplit = activeTabId !== null && splitTabIds.includes(activeTabId);
+
+  /**
+   * 可广播的终端会话清单（多执行输入条的目标）。
+   *
+   * 参数：无（读 terminalTabs 与 sessions）
+   * 核心流程：已打开的终端标签按会话名映射成 { sessionId, name }，
+   * 名称只用于界面展示，真正写入靠 sessionId 回查终端 id。
+   */
+  // terminalTabs 每次渲染都是新数组 -> 用 id 串当依赖，清单引用保持稳定，
+  // 否则下面的清理 effect 会白跑
+  const multiExecTabKey = terminalTabs.map((tab) => tab.id).join("|");
+  const multiExecTargetList = useMemo<MultiExecTarget[]>(() => {
+    const ids = multiExecTabKey === "" ? [] : multiExecTabKey.split("|");
+    return ids.flatMap((id) => {
+      const session = sessions.find((item) => item.id === id);
+      return session ? [{ sessionId: session.id, name: session.name }] : [];
+    });
+  }, [multiExecTabKey, sessions]);
+
+  /**
+   * 把一条命令写到所有已勾选的会话。
+   *
+   * 参数：text 为用户在输入条里敲的命令（可能含换行）
+   * 核心流程：多行归一成 \r 并把每条补上回车 -> 逐会话写一次（分屏就写两遍，
+   * 两块终端各有自己的终端 id）-> allSettled 汇总成功/失败条数，绝不抛异常。
+   */
+  const sendMultiExec = useCallback(
+    async (text: string): Promise<{ ok: number; failed: number }> => {
+      const payload = text.replace(/\r?\n/g, "\r");
+      const data = textToBase64(payload.endsWith("\r") ? payload : `${payload}\r`);
+      const ids: string[] = [];
+      for (const sessionId of multiExecTargets) {
+        const list = terminalIdList[sessionId];
+        if (list !== undefined && list.length > 0) {
+          ids.push(...list);
+          continue;
+        }
+        // 还没记录到数组（例如旧状态）就退回单条映射
+        const single = terminalIds[sessionId];
+        if (single !== undefined) ids.push(single);
+      }
+      if (ids.length === 0) return { ok: 0, failed: 0 };
+      const results = await Promise.allSettled(ids.map((id) => writeLocalTerminal(id, data)));
+      let ok = 0;
+      let failed = 0;
+      for (const result of results) {
+        if (result.status === "fulfilled") ok += 1;
+        else failed += 1;
+      }
+      return { ok, failed };
+    },
+    [multiExecTargets, terminalIdList, terminalIds],
+  );
+
+  /**
+   * 展开 / 收起底部多执行输入条。
+   *
+   * 参数：无（读 multiExecTargets 与可广播清单）
+   * 核心流程：首次展开时若一个都没勾就全选当前可广播会话；
+   * 收起只隐藏输入条，勾选状态保留，下次展开还是上次那批。
+   */
+  const toggleMultiExec = useCallback(() => {
+    const next = !multiExecOpen;
+    setMultiExecOpen(next);
+    // 首次展开且一个都没勾时自动全选；收起只隐藏输入条，勾选状态保留
+    if (next && multiExecTargets.length === 0) {
+      setMultiExecTargets(multiExecTargetList.map((target) => target.sessionId));
+    }
+  }, [multiExecOpen, multiExecTargets, multiExecTargetList]);
+
+  // 终端标签关掉后，从勾选里摘掉已经不存在的会话；先比对再 setState，避免无限循环
+  useEffect(() => {
+    const alive = new Set(multiExecTargetList.map((target) => target.sessionId));
+    setMultiExecTargets((prev) => {
+      const next = prev.filter((id) => alive.has(id));
+      if (next.length === prev.length) return prev;
+      return next;
+    });
+  }, [multiExecTargetList]);
 
   /** 「文件」分页绑定的会话：只有 ssh / sftp 能连，本地终端与无标签时为空 */
   const sftpSession =
@@ -2278,6 +2430,15 @@ function App() {
     },
     {
       kind: "button",
+      icon: <IconMultiExec size={22} />,
+      label: "多执行",
+      title: `展开底部广播输入条，一条命令发往多个会话 (${formatCombo(settings.shortcuts.multiExec)})`,
+      active: multiExecOpen,
+      disabled: multiExecTargetList.length === 0,
+      onClick: () => toggleMultiExec(),
+    },
+    {
+      kind: "button",
       icon: <IconKey size={22} />,
       label: "凭据库",
       title: "打开凭据库",
@@ -2465,6 +2626,22 @@ function App() {
   };
 
   /**
+   * 把键盘焦点移到分屏的某一块。
+   *
+   * 参数：index 为 0 左 / 1 右
+   * 核心流程：先更新活动索引（样式立刻跟手），再等一帧把焦点交给对应面板的
+   * xterm —— 同一帧内 setState 还没落到 DOM，直接 focus 会因为面板仍是隐藏/旧的
+   * 那一块而丢焦点。useCallback 稳定引用，快捷键 effect 的依赖数组才不会被它拖着重跑。
+   */
+  const focusPane = useCallback((index: 0 | 1) => {
+    setActivePaneIndex(index);
+    requestAnimationFrame(() => {
+      const target = index === 0 ? leftPaneRef : rightPaneRef;
+      target.current?.focus();
+    });
+  }, []);
+
+  /**
    * 全局快捷键分发。
    *
    * 参数：无
@@ -2538,11 +2715,61 @@ function App() {
         event.preventDefault();
         event.stopPropagation();
         setPaletteOpen(true);
+      } else if (hit("prevTab")) {
+        // 没有标签时放行：Alt+Left 留给页面/终端的默认行为
+        if (openTabIds.length > 0) {
+          event.preventDefault();
+          event.stopPropagation();
+          // 首个标签再往前 -> 末尾；当前标签不在列表里（异常）也落到末尾
+          const index = activeTabId === null ? -1 : openTabIds.indexOf(activeTabId);
+          const target = index <= 0 ? openTabIds[openTabIds.length - 1] : openTabIds[index - 1];
+          // 单标签时 target 等于当前值，跳过 setState 避免无谓重渲染
+          if (target !== activeTabId) setActiveTabId(target);
+        }
+      } else if (hit("nextTab")) {
+        if (openTabIds.length > 0) {
+          event.preventDefault();
+          event.stopPropagation();
+          // 末尾标签再往后 -> 首个；当前标签不在列表里（异常）也落到首个
+          const index = activeTabId === null ? -1 : openTabIds.indexOf(activeTabId);
+          const target =
+            index === -1 || index === openTabIds.length - 1 ? openTabIds[0] : openTabIds[index + 1];
+          if (target !== activeTabId) setActiveTabId(target);
+        }
+      } else if (hit("prevPane")) {
+        // 没分屏就没有「另一块」-> 键位放行，行为和标签切换以外的默认动作一致
+        if (activeSplit) {
+          event.preventDefault();
+          event.stopPropagation();
+          focusPane(0);
+        }
+      } else if (hit("nextPane")) {
+        if (activeSplit) {
+          event.preventDefault();
+          event.stopPropagation();
+          focusPane(1);
+        }
+      } else if (hit("multiExec")) {
+        // 无条件拦下：展开/收起输入条本身不该让终端吃到一个控制字符
+        event.preventDefault();
+        event.stopPropagation();
+        toggleMultiExec();
       }
     };
     window.addEventListener("keydown", onKeyDown, true);
     return () => window.removeEventListener("keydown", onKeyDown, true);
-  }, [settings.shortcuts, activeTabId, activeHasTerminal, startImport, closeTab, toggleSplit]);
+  }, [
+    settings.shortcuts,
+    activeTabId,
+    openTabIds,
+    activeHasTerminal,
+    activeSplit,
+    focusPane,
+    startImport,
+    closeTab,
+    toggleSplit,
+    toggleMultiExec,
+  ]);
 
   /**
    * 命令面板的命令清单。
@@ -2682,6 +2909,39 @@ function App() {
         if (activeTabId && activeHasTerminal) toggleSplit(activeTabId);
       },
     });
+    list.push({
+      id: "action:prevPane",
+      title: "焦点到左侧分屏",
+      titleEn: "Focus left pane",
+      group: "标签",
+      hint: formatCombo(shortcuts.prevPane),
+      keywords: ["pane", "split", "focus"],
+      run: () => {
+        if (activeSplit && activeTabId) focusPane(0);
+      },
+    });
+    list.push({
+      id: "action:nextPane",
+      title: "焦点到右侧分屏",
+      titleEn: "Focus right pane",
+      group: "标签",
+      hint: formatCombo(shortcuts.nextPane),
+      keywords: ["pane", "split", "focus"],
+      run: () => {
+        if (activeSplit && activeTabId) focusPane(1);
+      },
+    });
+
+    // 工具：一条命令同时发往多个会话
+    list.push({
+      id: "action:multiexec",
+      title: "多执行",
+      titleEn: "Multi execute",
+      group: "工具",
+      hint: formatCombo(shortcuts.multiExec),
+      keywords: ["multiexec", "broadcast", "同步输入"],
+      run: () => toggleMultiExec(),
+    });
 
     // 隧道
     list.push({
@@ -2761,6 +3021,9 @@ function App() {
     paletteTunnels,
     activeTabId,
     activeHasTerminal,
+    activeSplit,
+    focusPane,
+    toggleMultiExec,
     sidebarVisible,
     startTunnel,
     startImport,
@@ -2914,10 +3177,18 @@ function App() {
               const split = splitTabIds.includes(tab.id);
               // 两块终端各自独立建连接；外面再套停靠容器时，主区变窄会触发
               // xterm 的 ResizeObserver -> 两块终端都重新 fit
+              // 活动态只在分屏时出现在 DOM 上 -> 单屏永远不会画出描边；
+              // ref 只在「当前标签」上挂：所有标签的面板都常驻，全挂会让句柄指向最后一个标签
+              const isActiveTab = activeTabId === tab.id;
               const terminalSplit = (
                 <div className="terminal-split">
-                  <div className="terminal-pane">
+                  <div
+                    className={`terminal-pane${split && activePaneIndex === 0 ? " is-active" : ""}`}
+                  >
                     <TerminalPanel
+                      ref={isActiveTab ? leftPaneRef : null}
+                      active={split && activePaneIndex === 0}
+                      onActivate={() => setActivePaneIndex(0)}
                       session={tabSession}
                       theme={activeTheme}
                       fontSize={settings.terminalFontSize}
@@ -2935,9 +3206,14 @@ function App() {
                   </div>
                   {split && (
                     // 第二块面板独立建连接，与左侧互不影响
-                    <div className="terminal-pane">
+                    <div
+                      className={`terminal-pane${activePaneIndex === 1 ? " is-active" : ""}`}
+                    >
                       <TerminalPanel
                         key={`${tab.id}-split`}
+                        ref={isActiveTab ? rightPaneRef : null}
+                        active={split && activePaneIndex === 1}
+                        onActivate={() => setActivePaneIndex(1)}
                         session={tabSession}
                         theme={activeTheme}
                         fontSize={settings.terminalFontSize}
@@ -3175,6 +3451,28 @@ function App() {
               </section>
             ) : null}
           </div>
+
+          {/* 多执行输入条：贴在 tab-body 下面、远程监控上面。
+              打开时不禁用主终端输入 —— 与 MobaXterm 一致，两者并存 */}
+          {multiExecOpen && (
+            <MultiExecBar
+              targets={multiExecTargetList}
+              selected={multiExecTargets}
+              onToggle={(sessionId) =>
+                setMultiExecTargets((prev) =>
+                  prev.includes(sessionId)
+                    ? prev.filter((id) => id !== sessionId)
+                    : [...prev, sessionId],
+                )
+              }
+              onSelectAll={() =>
+                setMultiExecTargets(multiExecTargetList.map((item) => item.sessionId))
+              }
+              onClear={() => setMultiExecTargets([])}
+              onClose={() => setMultiExecOpen(false)}
+              onSend={sendMultiExec}
+            />
+          )}
 
           {/* 远程监控挂在会话主区底部：侧栏切到文件/工具/宏分页时它不会跟着消失。
               判据是「激活会话 + 它真的有活跃终端」：关掉连接但标签还留着时 terminalIds

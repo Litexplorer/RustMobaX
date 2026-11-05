@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
@@ -70,6 +70,15 @@ type Props = {
   banner?: boolean;
   /** 文件面板是否跟随终端目录（设置项 sftp.followCwd），横幅里展示「开 / 关」 */
   followCwd?: boolean;
+  /**
+   * 本面板是不是分屏里当前活动的这一块。
+   *
+   * 只用于上层加 is-active 样式与表达语义，组件内部不改任何行为 ->
+   * 这里只声明不解构，避免多一个用不上的变量。
+   */
+  active?: boolean;
+  /** 用户点击或聚焦到本面板时上报，上层据此挪动活动态（只影响样式，不影响连接） */
+  onActivate?: () => void;
 };
 
 type Status = "starting" | "running" | "exited" | "error";
@@ -661,29 +670,40 @@ function buildBanner(options: BannerOptions): string {
   return `\r\n${top}\r\n${row(line2, line2Width)}\r\n${row(line3, line3Width)}\r\n${bottom}\r\n\r\n`;
 }
 
+/** 面板向父层暴露的最小能力：把键盘焦点交给本块的 xterm */
+export type TerminalPanelHandle = {
+  /** 参数：无，等价于点一下终端本体 */
+  focus: () => void;
+};
+
 /**
  * 终端面板，本地与 SSH 共用。
  *
  * 参数：session 为要运行的会话，password 为 SSH 密码
  * 核心流程：挂载时创建 xterm → 按协议选择启动方式 → 双向转发数据 →
  * 监听容器尺寸同步 resize；卸载时关闭会话并回收实例。
+ *
+ * 用 forwardRef 只为把 focus 暴露给上层（分屏切换焦点），不改变挂载/卸载时机；
+ * 调用点仍然写 `<TerminalPanel ... />`，只是多了一个可选 ref。
  */
-export function TerminalPanel({
-  session,
-  theme,
-  fontSize,
-  fontFamily,
-  onFontSizeChange,
-  sshAuth,
-  acceptUnknownHostKey = false,
-  onHostKeyPrompt,
-  onHostKeyMismatch,
-  onCwdChange,
-  onClosePane,
-  onTerminalId,
-  banner = true,
-  followCwd = true,
-}: Props) {
+export const TerminalPanel = forwardRef<TerminalPanelHandle, Props>(
+  function TerminalPanel({
+    session,
+    theme,
+    fontSize,
+    fontFamily,
+    onFontSizeChange,
+    sshAuth,
+    acceptUnknownHostKey = false,
+    onHostKeyPrompt,
+    onHostKeyMismatch,
+    onCwdChange,
+    onClosePane,
+    onTerminalId,
+    banner = true,
+    followCwd = true,
+    onActivate,
+  }: Props, ref) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const searchApiRef = useRef<SearchApi | null>(null);
@@ -703,6 +723,18 @@ export function TerminalPanel({
   useEffect(() => {
     searchOpenRef.current = searchOpen;
   }, [searchOpen]);
+
+  // 分屏切换焦点：上层拿到句柄后调 focus()，等价于点一下终端本体。
+  // 只依赖稳定的 termRef -> 同一个句柄对象整个生命周期都有效
+  useImperativeHandle(
+    ref,
+    () => ({
+      focus: () => {
+        termRef.current?.focus();
+      },
+    }),
+    [],
+  );
 
   /**
    * 横幅开关与目录跟随都只在「建连那一刻」读一次。
@@ -834,11 +866,17 @@ export function TerminalPanel({
     };
     claimActive();
 
-    // 鼠标按下/焦点进入都算「用户在操作这一块」-> 重新认领，抢回上报权
-    host.addEventListener("pointerdown", claimActive, true);
-    host.addEventListener("focusin", claimActive, true);
+    // 鼠标按下/焦点进入都算「用户在操作这一块」-> 重新认领，抢回上报权；
+    // 只有真实用户交互才把「活动 pane」上报给上层（初始挂载/自动认领不上报，
+    // 否则分屏刚打开时会把 activePaneIndex 覆盖成后挂载的那块）
+    const claimByUser = () => {
+      claimActive();
+      onActivate?.();
+    };
+    host.addEventListener("pointerdown", claimByUser, true);
+    host.addEventListener("focusin", claimByUser, true);
     const textarea = term.textarea;
-    textarea?.addEventListener("focus", claimActive);
+    textarea?.addEventListener("focus", claimByUser);
 
     // 切标签时终端是常驻的（只是被 is-hidden 藏起来）-> 隐藏的面板不能继续
     // 霸占上报权，重新显示出来的那一块要立刻接上，否则目录跟随会「卡在上一个标签」
@@ -1044,9 +1082,9 @@ export function TerminalPanel({
     return () => {
       disposed = true;
       host.removeEventListener("paste", handlePaste, true);
-      host.removeEventListener("pointerdown", claimActive, true);
-      host.removeEventListener("focusin", claimActive, true);
-      textarea?.removeEventListener("focus", claimActive);
+      host.removeEventListener("pointerdown", claimByUser, true);
+      host.removeEventListener("focusin", claimByUser, true);
+      textarea?.removeEventListener("focus", claimByUser);
       visibility.disconnect();
       if (cwdTimer !== null) clearInterval(cwdTimer);
       // 活动面板卸载 -> 让位，避免之后没有任何面板能上报目录
@@ -1188,4 +1226,4 @@ export function TerminalPanel({
       )}
     </div>
   );
-}
+});
