@@ -77,6 +77,8 @@ export function TunnelFormDialog(props: Props) {
   const [targetPort, setTargetPort] = useState(
     config && config.targetPort > 0 ? String(config.targetPort) : "",
   );
+  /** 启动应用时自动拉起；新建默认不勾选，编辑按库里已有值回显 */
+  const [autoStart, setAutoStart] = useState(config?.autoStart === true);
 
   const [errors, setErrors] = useState<FieldErrors>({});
   const [submitError, setSubmitError] = useState<string | null>(null);
@@ -145,6 +147,7 @@ export function TunnelFormDialog(props: Props) {
       listenPort: listen ?? 0,
       targetHost: needsTarget ? targetHost.trim() : "",
       targetPort: needsTarget ? (target ?? 0) : 0,
+      autoStart,
     };
 
     setSaving(true);
@@ -303,6 +306,24 @@ export function TunnelFormDialog(props: Props) {
             )}
 
             {!needsTarget && <p className="setting-note">SOCKS5 代理，无需填写目标地址与端口</p>}
+
+            {/* 自动启动：随配置一起提交；依赖密码凭据时由下面的次要说明提前告知 */}
+            <div className="setting-row">
+              <label className="setting-label" htmlFor="tunnel-form-auto-start">
+                自动启动
+              </label>
+              <label className="check-line">
+                <input
+                  id="tunnel-form-auto-start"
+                  className="inline-check"
+                  type="checkbox"
+                  checked={autoStart}
+                  onChange={(event) => setAutoStart(event.target.checked)}
+                />
+                <span>启动应用时自动启动（Auto start on launch）</span>
+              </label>
+            </div>
+            <p className="setting-note">保险库未解锁时不会自动启动</p>
 
             {submitError && <p className="form-error">{submitError}</p>}
           </div>

@@ -24,6 +24,8 @@ export interface TunnelConfig {
   targetHost: string;
   /** dynamic 类型可为 0 */
   targetPort: number;
+  /** 启动应用时是否自动拉起这条隧道（老数据缺该字段时后端按 false 处理） */
+  autoStart: boolean;
   createdAt: number;
   updatedAt: number;
 }
@@ -37,6 +39,8 @@ export interface TunnelConfigInput {
   listenPort: number;
   targetHost: string;
   targetPort: number;
+  /** 启动应用时是否自动拉起；不传时后端按 false 处理 */
+  autoStart: boolean;
 }
 
 /** 一条隧道的运行时信息，字段与后端 TunnelInfo 一一对应。 */

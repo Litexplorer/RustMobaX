@@ -61,6 +61,8 @@ export type AppSettings = {
   sidebarDefaultTab: SidebarTab;
   /** 切到「文件」分页时是否自动建立 SFTP 连接 */
   sidebarAutoConnect: boolean;
+  /** 连接成功后是否在终端顶部画一块信息横幅 */
+  terminalBanner: boolean;
   /** 侧栏宽度（px），260 ~ 520，拖动侧栏右边缘调整 */
   sftpWidth: number;
   /** 文件分页是否跟随终端上报的工作目录 */
@@ -79,6 +81,7 @@ export const SETTING_KEYS: Record<keyof AppSettings, string> = {
   terminalFontFamily: "terminal.fontFamily",
   sidebarDefaultTab: "sidebar.defaultTab",
   sidebarAutoConnect: "sidebar.autoConnect",
+  terminalBanner: "terminal.banner",
   // 旧键 sftp.dock / sftp.autoOpen 自本版起不再读取：标签内停靠面板已经移除，
   // 库里的旧值原样保留不删，需要时仍可人工回滚
   sftpWidth: "sftp.width",
@@ -109,6 +112,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   terminalFontFamily: FONT_STACKS.default,
   sidebarDefaultTab: "sessions",
   sidebarAutoConnect: true,
+  terminalBanner: true,
   sftpWidth: 280,
   sftpFollowCwd: true,
   shortcuts: DEFAULT_SHORTCUTS,
@@ -296,6 +300,7 @@ export function parseSettings(raw: Record<string, string>): AppSettings {
       raw[SETTING_KEYS.sidebarAutoConnect],
       DEFAULT_SETTINGS.sidebarAutoConnect,
     ),
+    terminalBanner: parseFlag(raw[SETTING_KEYS.terminalBanner], DEFAULT_SETTINGS.terminalBanner),
     sftpWidth: clampSftpWidth(
       parseNumber(raw[SETTING_KEYS.sftpWidth], DEFAULT_SETTINGS.sftpWidth),
     ),

@@ -2620,6 +2620,73 @@ body.is-resizing-sidebar * {
   white-space: nowrap;
 }
 
+/* 名称单元格：名字可截断（min-width:0），自动启动标签不参与压缩，行高不变 */
+.tunnel-name-wrap {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.tunnel-name-wrap .tunnel-name {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* 「自动」开关：不再是只读标签，点一下就切换自动启动。
+   两态宽度必须完全一致 —— border 常驻（只有关闭态才上色）、字号/内边距/文字都不变，
+   只换颜色与填充，所以列宽与行高不会被它带动。
+   开启=强调色胶囊（一眼看出已开），关闭=灰色描边（轻但可见，
+   否则用户还是发现不了这个功能）。 */
+.tunnel-auto-tag {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 4px;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  font-size: calc(10px * var(--ui-scale));
+  /* 行高 1.2 + 上下各 1px 边框 = 14px，正好等于原来那张只读标签的高度，
+     名称行的行高因此一点都不变；宽度也只多了两态共同的 2px 边框 */
+  line-height: 1.2;
+  white-space: nowrap;
+  transition:
+    color 0.12s ease,
+    background-color 0.12s ease,
+    border-color 0.12s ease;
+}
+
+.tunnel-auto-tag.is-on {
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
+  color: var(--accent);
+}
+
+/* 关闭态自己用透明底 + 细描边，不跟通用 button 的深色填充走 */
+.tunnel-auto-tag.is-off {
+  background: transparent;
+  border-color: var(--border-strong);
+  color: var(--text-faint);
+}
+
+/* 通用 button:hover 会把描边改回中性灰、背景改深 -> 两态各自保持自己的配色 */
+.tunnel-auto-tag.is-on:hover:not(:disabled) {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.tunnel-auto-tag.is-off:hover:not(:disabled) {
+  background: var(--bg-chip);
+  border-color: var(--text-faint);
+  color: var(--text-dim);
+}
+
+/* 提交中：半透明交给全局 button:disabled，这里只把光标换成等待态 */
+.tunnel-auto-tag:disabled {
+  cursor: wait;
+}
+
 .tunnel-row-actions {
   display: flex;
   flex-wrap: nowrap;

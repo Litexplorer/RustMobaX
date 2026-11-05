@@ -750,6 +750,22 @@ export function SettingsDialog({
                 user@rustmobax:~$ echo 字号 {settings.terminalFontSize}px
               </div>
             </div>
+
+            <div className="setting-row">
+              <label className="setting-label" htmlFor="settings-terminal-banner">
+                连接时显示信息横幅
+              </label>
+              <label className="check-line">
+                <input
+                  id="settings-terminal-banner"
+                  className="inline-check"
+                  type="checkbox"
+                  checked={settings.terminalBanner}
+                  onChange={(event) => onChange("terminalBanner", event.target.checked)}
+                />
+                <span>连上后在终端顶部画出本次连接生效的认证方式、SFTP 与隧道数</span>
+              </label>
+            </div>
           </section>
 
           <section className="settings-group">

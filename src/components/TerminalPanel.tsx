@@ -8,8 +8,9 @@ import type { Protocol, Session } from "../api/session";
 import { errorDetail, errorKind, errorMessage } from "../api/session";
 import { clampFontSize } from "../api/settings";
 import type { ThemeKind, ThemePalette } from "../lib/themes";
-import { themeToXterm } from "../lib/themes";
+import { mix, themeToXterm } from "../lib/themes";
 import type { HostKeyInfo, SshAuthRequest, TerminalEvent } from "../api/terminal";
+import { tunnelConfigList } from "../api/tunnel";
 import { IconClose, IconSearch } from "./icons";
 import { TerminalSearchBar } from "./TerminalSearchBar";
 import { PasteConfirmDialog, splitPasteLines } from "./PasteConfirmDialog";
@@ -60,6 +61,15 @@ type Props = {
    * 上层只在记录仍等于它时才删除，避免先退出的那一块把还活着的那块也注销掉。
    */
   onTerminalId?: (sessionId: string, terminalId: string | null, expectedId?: string) => void;
+  /**
+   * 连接成功后是否在终端顶部画一块信息横幅（设置项 terminal.banner）。
+   *
+   * 只在「建连那一刻」读一次 -> 中途关掉开关不会重连，也不会擦掉已经画好的横幅；
+   * 组件自己不读设置库，缺省开启由 DEFAULT_SETTINGS 与这里的默认值共同保证。
+   */
+  banner?: boolean;
+  /** 文件面板是否跟随终端目录（设置项 sftp.followCwd），横幅里展示「开 / 关」 */
+  followCwd?: boolean;
 };
 
 type Status = "starting" | "running" | "exited" | "error";
@@ -382,6 +392,275 @@ type SearchApi = {
   clear: () => void;
 };
 
+/* ------------------------------------------------------------------ *
+ * 连接横幅：客户端自己画在终端最上方的一块方框
+ *
+ * 参照 MobaXterm 的做法：连上之后由本地渲染一段文本（不是远端发来的），
+ * 用来看清「这次连接实际生效了什么」。只画客户端已知的事实，
+ * 不探测远端信息，也不往远端注入任何字节。
+ * ------------------------------------------------------------------ */
+
+/** 横幅宽度区间（可见列数）：太窄装不下文案，太宽在宽屏上显得空 */
+const BANNER_MIN_WIDTH = 32;
+const BANNER_MAX_WIDTH = 78;
+/** 版式固定的几段文字宽度，" RustMobaX " 正好 11 列（首角与两侧各 1 列另算） */
+const BANNER_TITLE = "RustMobaX";
+/** 事实之间的分隔符 */
+const BANNER_SEPARATOR = " · ";
+
+const ANSI_RESET = "\x1b[0m";
+const ANSI_BOLD = "\x1b[1m";
+
+/**
+ * 宽字符区间：中日韩文字、全角标点在东亚洲字宽下各占两列。
+ *
+ * 参数：无（正则常量）
+ * 核心流程：只做区间粗判，覆盖常见中文/日文/韩文/全角符号；
+ * 万一把某个字符判错，后果也只是右侧边框差一列，不影响功能。
+ */
+const WIDE_CHAR =
+  /[\u1100-\u115F\u2E80-\u303E\u3041-\u33FF\u3400-\u4DBF\u4E00-\u9FFF\uA000-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFF60\uFFE0-\uFFE6]/;
+
+/**
+ * 单个字符在终端里占几列。
+ *
+ * 参数：ch 为单个码位对应的字符
+ * 核心流程：命中宽字符区间返回 2，其余（含 emoji 之外的普通字符）按 1 算。
+ */
+function charWidth(ch: string): number {
+  return WIDE_CHAR.test(ch) ? 2 : 1;
+}
+
+/**
+ * 一段文本在终端里占几列。
+ *
+ * 参数：text 为纯文本（不能带 ANSI 转义，转义序列不占列）
+ * 核心流程：逐码位累加显示宽度 -> 补空格与右侧边框才能对齐。
+ */
+function textWidth(text: string): number {
+  let width = 0;
+  for (const ch of text) width += charWidth(ch);
+  return width;
+}
+
+/**
+ * 按显示宽度截断，超出部分用省略号收尾。
+ *
+ * 参数：text 为原始文本，max 为允许的最大显示列数
+ * 核心流程：先量宽度，装得下就原样返回；装不下就逐字累加到 max-1 为止，
+ * 末尾补一个「…」（占 1 列）-> 结果宽度永远不超过 max。
+ */
+function truncateToWidth(text: string, max: number): string {
+  if (textWidth(text) <= max) return text;
+  let used = 0;
+  let out = "";
+  for (const ch of text) {
+    const width = charWidth(ch);
+    if (used + width > max - 1) break;
+    used += width;
+    out += ch;
+  }
+  return `${out}…`;
+}
+
+/**
+ * 把十六进制主题色转成 RGB 三元组。
+ *
+ * 参数：hex 为 #rgb 或 #rrggbb
+ * 核心流程：补全三位简写后取前 6 位解析，解析不出来时回落到中灰
+ * -> 脏色值最多让横幅发灰，不会抛异常也不会写出非法转义。
+ */
+function hexToRgb(hex: string): [number, number, number] {
+  const raw = hex.trim().replace(/^#/, "");
+  const full = raw.length === 3 ? raw.split("").map((ch) => ch + ch).join("") : raw;
+  const value = Number.parseInt(full.slice(0, 6), 16);
+  if (!Number.isFinite(value)) return [140, 140, 140];
+  return [(value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+}
+
+/**
+ * 真彩色前景色的 ANSI 序列。
+ *
+ * 参数：hex 为十六进制色
+ * 核心流程：走 24 位真彩色（38;2;r;g;b）而不是 256 色索引，
+ * 这样浅色/深色主题都能用上主题里那一档精确的 accent，不必凑近似色。
+ */
+function ansiFg(hex: string): string {
+  const [r, g, b] = hexToRgb(hex);
+  return `\x1b[38;2;${r};${g};${b}m`;
+}
+
+/** 横幅里的一格「键 + 值」：键用暗一档的文字色，值用 accent 高亮 */
+type BannerFact = { key: string; value: string };
+
+/** 串口校验位的单字母写法，与 8-N-1 这种口语记法一致 */
+const PARITY_LETTER: Record<string, string> = { none: "N", odd: "O", even: "E" };
+/** 串口流控的中文说明 */
+const FLOW_LABEL: Record<string, string> = {
+  none: "无流控",
+  software: "软件流控",
+  hardware: "硬件流控",
+};
+
+/**
+ * 横幅里的认证方式文案。
+ *
+ * 参数：session 为要连接的会话
+ * 核心流程：先看 extra 里是否引用了保险库里的凭据（credentialId 是密码凭据、
+ * passphraseCredentialId 是私钥口令），再按 authKind 落到「密码 / 密钥 / Agent」。
+ * 只做文案映射，不去读凭据本身。
+ */
+function bannerAuthLabel(session: Session): string {
+  const extra = sessionExtraObject(session);
+  const vaultPassword =
+    typeof extra.credentialId === "string" && extra.credentialId.trim() !== "";
+  const vaultPassphrase =
+    typeof extra.passphraseCredentialId === "string" &&
+    extra.passphraseCredentialId.trim() !== "";
+  if (session.authKind === "agent") return "Agent";
+  if (session.authKind === "key") return vaultPassphrase ? "密钥（保险库）" : "密钥";
+  return vaultPassword ? "密码（保险库）" : "密码";
+}
+
+/**
+ * 横幅第二行的「连到哪」。
+ *
+ * 参数：session 为要连接的会话
+ * 核心流程：SSH / Telnet 拼 user@host:port（没填用户名就省掉 user@），
+ * 串口显示设备路径，WSL 显示发行版，本地会话就写「本地 shell」。
+ */
+function bannerTarget(session: Session): string {
+  if (session.protocol === "serial") return serialDevicePathOf(session) || "串口设备";
+  if (session.protocol === "wsl") {
+    const distro = wslDistroOf(session);
+    return distro ? `WSL ${distro}` : "WSL 默认发行版";
+  }
+  if (session.protocol !== "ssh" && session.protocol !== "telnet") return "本地 shell";
+  const host = session.host?.trim() || "—";
+  const port = session.port ?? (session.protocol === "ssh" ? 22 : 23);
+  const user = session.username?.trim() ?? "";
+  return user ? `${user}@${host}:${port}` : `${host}:${port}`;
+}
+
+/**
+ * 横幅第三行的若干条事实。
+ *
+ * 参数：session 为会话，followCwd 为目录跟随开关，tunnelCount 为该会话的
+ *       autoStart 隧道条数（null = 还没拿到，显示「—」）
+ * 核心流程：按协议只挑说得准的字段 —— SSH 才有认证方式、SFTP、隧道；
+ * Telnet 只说协议，串口说线路参数，本地/WSL 只说目录跟随。
+ * 不显示任何需要探测远端才能知道的东西。
+ */
+function bannerFacts(
+  session: Session,
+  followCwd: boolean,
+  tunnelCount: number | null,
+): BannerFact[] {
+  if (session.protocol === "ssh") {
+    return [
+      { key: "认证", value: bannerAuthLabel(session) },
+      // SFTP 走 SSH 子系统、复用同一条连接 -> 只要是 SSH 会话就必然可用
+      { key: "SFTP", value: "可用" },
+      { key: "目录跟随", value: followCwd ? "开" : "关" },
+      { key: "隧道", value: tunnelCount === null ? "—" : `${tunnelCount} 条` },
+    ];
+  }
+  if (session.protocol === "telnet") {
+    return [{ key: "协议", value: "Telnet" }];
+  }
+  if (session.protocol === "serial") {
+    const line = serialLineOptionsOf(session);
+    const parity = PARITY_LETTER[line.parity] ?? "N";
+    return [
+      { key: "线路", value: `${line.baudRate} ${line.dataBits}-${parity}-${line.stopBits}` },
+      { key: "流控", value: FLOW_LABEL[line.flowControl] ?? "无流控" },
+    ];
+  }
+  return [{ key: "目录跟随", value: followCwd ? "开" : "关" }];
+}
+
+/** 画一块横幅需要的全部输入 */
+type BannerOptions = {
+  /** 终端列数，决定横幅宽度（写一次就定下来，之后 resize 不重绘） */
+  cols: number;
+  /** 当前主题，颜色全部取自它 -> 深色/浅色主题下都能看清 */
+  theme: ThemePalette;
+  session: Session;
+  followCwd: boolean;
+  tunnelCount: number | null;
+};
+
+/**
+ * 拼出整块横幅的文本（含 ANSI 真彩色与前后空行）。
+ *
+ * 参数：见 BannerOptions
+ * 核心流程：按 term.cols 定宽度并夹进 32~78 -> 逐行padding 到同一列宽
+ * （中文按两列算，否则右边框会错位）-> 关键字上色：
+ * 边框 accent 压暗一档、标题加粗 accent、键名 textDim、值 accent。
+ * 内容过长时优先截断值、必要时丢弃末尾的事实，宁可少说一句也不撑破方框。
+ */
+function buildBanner(options: BannerOptions): string {
+  const { cols, theme, session, followCwd, tunnelCount } = options;
+  const width = Math.max(BANNER_MIN_WIDTH, Math.min(cols - 1, BANNER_MAX_WIDTH));
+  /** 内容区可用列数：左右边框各 1 列 + 左侧固定一个空格 + 右侧至少留一个空格 */
+  const contentMax = width - 4;
+
+  // 边框用 accent 与背景混合后的暗一档，深色下是暗蓝、浅色下是浅蓝，都不会抢内容
+  const border = ansiFg(mix(theme.colors.accent, theme.colors.bg, 0.45));
+  const title = `${ANSI_BOLD}${ansiFg(theme.colors.accent)}${BANNER_TITLE}${ANSI_RESET}`;
+  const keyPaint = ansiFg(theme.colors.textDim);
+  const valuePaint = ansiFg(theme.colors.accent);
+  const namePaint = ansiFg(theme.colors.text);
+
+  /**
+   * 给一行内容套上左右边框。
+   *
+   * 参数：body 为已带 ANSI 的内容，bodyWidth 为它的可见列数
+   * 核心流程：按可见列数补右侧空格 -> 右边界永远对齐在 width 列。
+   */
+  const row = (body: string, bodyWidth: number): string => {
+    const pad = " ".repeat(Math.max(1, width - 3 - bodyWidth));
+    return `${border}│${ANSI_RESET} ${body}${pad}${border}│${ANSI_RESET}`;
+  };
+
+  // 第二行：会话名 + 连到哪
+  const nameRaw = session.name.trim() || "未命名会话";
+  const nameText = truncateToWidth(nameRaw, Math.max(6, Math.floor(contentMax / 2) - 2));
+  const targetText = truncateToWidth(bannerTarget(session), Math.max(6, contentMax - 2 - textWidth(nameText)));
+  const line2 = `${namePaint}${nameText}${ANSI_RESET}  ${valuePaint}${targetText}${ANSI_RESET}`;
+  const line2Width = textWidth(nameText) + 2 + textWidth(targetText);
+
+  // 第三行：键值对，放不下就丢末尾的事实（值为空也不留「隧道 —」那样的半截）
+  const chosen: BannerFact[] = [];
+  let line3Width = 0;
+  const sepWidth = textWidth(BANNER_SEPARATOR);
+  for (const fact of bannerFacts(session, followCwd, tunnelCount)) {
+    const cost = textWidth(fact.key) + 1 + textWidth(fact.value) + (chosen.length > 0 ? sepWidth : 0);
+    if (chosen.length === 0) {
+      // 第一条永远保留，值太长就截断，保证第三行至少有一句有用的话
+      const valueMax = Math.max(2, contentMax - textWidth(fact.key) - 1);
+      const value = truncateToWidth(fact.value, valueMax);
+      chosen.push({ key: fact.key, value });
+      line3Width = textWidth(fact.key) + 1 + textWidth(value);
+      continue;
+    }
+    if (line3Width + cost > contentMax) break;
+    chosen.push(fact);
+    line3Width += cost;
+  }
+  const line3 = chosen
+    .map((fact) => `${keyPaint}${fact.key}${ANSI_RESET} ${valuePaint}${fact.value}${ANSI_RESET}`)
+    .join(`${keyPaint}${BANNER_SEPARATOR}${ANSI_RESET}`);
+
+  // 顶栏：┌ RustMobaX ───┐，" " + 标题 + " " 占 11 列，两侧角各 1 列
+  const fill = Math.max(1, width - BANNER_TITLE.length - 4);
+  const top = `${border}┌${ANSI_RESET} ${title} ${border}${"─".repeat(fill)}┐${ANSI_RESET}`;
+  const bottom = `${border}└${"─".repeat(width - 2)}┘${ANSI_RESET}`;
+
+  // 前后各留一个空行，避免横幅与 motd、shell 提示符粘在一起
+  return `\r\n${top}\r\n${row(line2, line2Width)}\r\n${row(line3, line3Width)}\r\n${bottom}\r\n\r\n`;
+}
+
 /**
  * 终端面板，本地与 SSH 共用。
  *
@@ -402,6 +681,8 @@ export function TerminalPanel({
   onCwdChange,
   onClosePane,
   onTerminalId,
+  banner = true,
+  followCwd = true,
 }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -422,6 +703,20 @@ export function TerminalPanel({
   useEffect(() => {
     searchOpenRef.current = searchOpen;
   }, [searchOpen]);
+
+  /**
+   * 横幅开关与目录跟随都只在「建连那一刻」读一次。
+   *
+   * 放 ref 而不是塞进建连 effect 的依赖数组：那两个值一变就会重建终端，
+   * 等于改个设置把用户的会话掐了 —— 这里只更新引用，当前连接不受影响。
+   * 初始值取 useRef 的入参，所以首帧就连上时读到的也是正确值。
+   */
+  const bannerRef = useRef(banner);
+  const followCwdRef = useRef(followCwd);
+  useEffect(() => {
+    bannerRef.current = banner;
+    followCwdRef.current = followCwd;
+  }, [banner, followCwd]);
 
   /**
    * 收起搜索条。
@@ -574,10 +869,62 @@ export function TerminalPanel({
      */
     let exitReported = false;
 
+    /**
+     * 横幅是否已经画过。
+     *
+     * 参数：无
+     * 核心流程：一个面板实例一个标记 -> 重置发生在 effect 重跑（重连）与卸载重建时，
+     * 因此重连一定重新画，同一次连接绝不会画第二遍。
+     */
+    let bannerWritten = false;
+    /** 该会话下 autoStart 的隧道条数，null 表示还没取到，横幅里显示「—」 */
+    let tunnelCount: number | null = null;
+
+    /**
+     * 画一次连接横幅。
+     *
+     * 参数：无（读本 effect 闭包里的 session / theme / term）
+     * 核心流程：先置位再写 -> 并发路径重入时直接返回；
+     * 开关关掉时只置位不写，后续路径也不会再画。
+     * 写入走 term.write，xterm 内部有写队列，先写的横幅一定排在后面的远端数据前面。
+     */
+    const flushBanner = () => {
+      if (bannerWritten) return;
+      bannerWritten = true;
+      if (!bannerRef.current) return;
+      term.write(
+        buildBanner({
+          cols: term.cols,
+          theme,
+          session,
+          followCwd: followCwdRef.current,
+          tunnelCount,
+        }),
+      );
+    };
+
+    // 隧道条数：SSH 会话才有意义，横幅关着就完全不碰隧道库；
+    // 这里只发一次轻量请求，读失败就当「未知」（显示「—」），不打扰用户。
+    if (bannerRef.current && session.protocol === "ssh") {
+      void tunnelConfigList()
+        .then((configs) => {
+          if (disposed) return;
+          tunnelCount = configs.filter(
+            (config) => config.sessionId === session.id && config.autoStart,
+          ).length;
+        })
+        .catch(() => {
+          tunnelCount = null;
+        });
+    }
+
     // 后端推来的字节直接喂给 xterm -> 保留原始控制序列
     const handleEvent = (event: TerminalEvent) => {
       if (disposed) return;
       if (event.kind === "data") {
+        // 远端 motd 可能比建连成功的 Promise 回调更早到达 -> 首个字节到达时补画，
+        // 保证横幅永远排在第一段远端输出之前（画过了就是空操作）
+        flushBanner();
         term.write(base64ToBytes(event.chunk));
         return;
       }
@@ -632,6 +979,8 @@ export function TerminalPanel({
           return;
         }
         terminalId = id;
+        // 建连成功 -> 立刻画横幅；首字节先到的话这里已是空操作
+        flushBanner();
         setStatus("running");
         onTerminalId?.(session.id, id);
         if (session.protocol === "local") {

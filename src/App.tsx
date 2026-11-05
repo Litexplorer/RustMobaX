@@ -63,8 +63,8 @@ import { KnownHostsDialog } from "./components/KnownHostsDialog";
 import { TunnelDialog } from "./components/TunnelDialog";
 import { TunnelFormDialog } from "./components/TunnelFormDialog";
 import { CommandPalette } from "./components/CommandPalette";
-import { tunnelConfigList, tunnelStart } from "./api/tunnel";
-import type { TunnelConfig } from "./api/tunnel";
+import { tunnelConfigList, tunnelList, tunnelStart } from "./api/tunnel";
+import type { TunnelConfig, TunnelInfo } from "./api/tunnel";
 import { TerminalPanel } from "./components/TerminalPanel";
 import { SftpPanel } from "./components/SftpPanel";
 import { formatMemory, formatRate, remoteMetrics, shortenAddress, systemMetrics } from "./api/metrics";
@@ -106,6 +106,8 @@ const COLLAPSED_KEY = "rustmobax.collapsedGroups";
 const LEGACY_SFTP_WIDTH_KEY = "rustmobax.sftpWidth";
 /** 设置写库的防抖间隔（毫秒）：拖动滑块时只落最后一次 */
 const SETTINGS_SAVE_DELAY = 300;
+/** 凭据库没解锁（未初始化，或锁着但这批隧道不碰库）时，自动启动等应用安静下来再试的延迟（毫秒） */
+const AUTO_START_FALLBACK_DELAY = 3000;
 
 type DialogState =
   | { kind: "none" }
@@ -307,6 +309,40 @@ type ResolvedSshAuth =
   | { kind: "needKeyPassphrase"; path: string; credentialId?: string };
 
 /**
+ * 判断一个会话启动时是否必须先解锁凭据库。
+ *
+ * 参数：session 为隧道背后的 SSH 会话
+ * 核心流程：只有「要用的密码/口令存在库里」才需要解锁 —— 密码认证且记了
+ * credentialId，或者私钥口令记了 passphraseCredentialId；
+ * 纯密钥、无口令的会话不碰库，解锁与否都能连上。extra 解析不了就当不需要，
+ * 免得为一个坏配置无谓地打断用户。
+ */
+function sessionNeedsVault(session: Session): boolean {
+  if (!session.extra) return false;
+  try {
+    const parsed = JSON.parse(session.extra) as {
+      credentialId?: string;
+      passphraseCredentialId?: string;
+    };
+    if (session.authKind === "password" && (parsed.credentialId ?? "") !== "") return true;
+    return (parsed.passphraseCredentialId ?? "") !== "";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 自动启动的推进阶段。
+ *
+ * 用一个 ref 记住整个进程走到哪一步，保证探测、弹窗、启动各自只发生一次：
+ * idle 还没探测；probing 正在读配置判断要不要先解锁；
+ * awaitingVault 已主动弹出解锁框、等解锁后续上；declined 用户关掉了这次弹窗，
+ * 本次会话不再自动弹（但用户自己解锁后仍允许跑一轮）；
+ * done 已执行或已决定不执行，此后任何状态变化都不再推进。
+ */
+type AutoStartPhase = "idle" | "probing" | "awaitingVault" | "declined" | "done";
+
+/**
  * 从会话配置解析出可用的认证方式。
  *
  * 参数：session 为 SSH 会话，known 为本次运行已输入的认证
@@ -370,6 +406,19 @@ function App() {
   const [paletteTunnels, setPaletteTunnels] = useState<TunnelConfig[]>([]);
   /** 隧道表单保存成功后自增，用来让隧道列表重新拉一次配置 */
   const [tunnelRevision, setTunnelRevision] = useState(0);
+  /**
+   * 自动启动走到哪一步（见 AutoStartPhase）。
+   *
+   * 用 ref 而不是 state：整个进程生命周期只推进一轮，凭据库后续再变状态也不重弹窗、
+   * 不重跑，更不能因为重渲染多拉起一条隧道。
+   */
+  const autoStartPhase = useRef<AutoStartPhase>("idle");
+  /**
+   * 启动探测弹解锁框时，等解锁后自动连接的隧道条数。
+   *
+   * 只用于在解锁框里说明「为什么要你输密码」，null 表示这次弹窗不是启动探测拉起来的。
+   */
+  const [autoStartVaultHint, setAutoStartVaultHint] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [confirmState, setConfirmState] = useState<{ message: string; run: () => void } | null>(
@@ -401,8 +450,26 @@ function App() {
   const [vaultError, setVaultError] = useState<string | null>(null);
   /** 因凭据库锁定而暂缓打开的会话 -> 解锁成功后自动续上 */
   const [pendingVaultOpen, setPendingVaultOpen] = useState<Session | null>(null);
+  /**
+   * 因凭据库锁定而暂缓启动的隧道 id 列表 -> 解锁成功后串行续跑一次。
+   *
+   * 用 ref 而不是 state：它只表示「有一批待办」，不需要参与渲染；
+   * 「全部启动」批量被拦下时整批挂在这里，解锁后跑一遍就够，所以只会弹一次解锁框。
+   * 与自动启动的 autoStartPhase 完全独立，两条流程各写各自的标记，互不清对方的账。
+   */
+  const pendingTunnelStarts = useRef<string[]>([]);
+  /**
+   * 这批待启动是用户从隧道列表点出来的 -> 解锁后把列表放回去。
+   *
+   * 命令面板发起的启动不写这个标记：面板那时已经关了，解锁后再强行弹列表会突兀。
+   */
+  const pendingTunnelStartsFromList = useRef(false);
   /** 凭据库弹窗是被密码/口令弹窗叫起来的 -> 解锁后只关弹窗，回到仍挂着的口令弹窗 */
   const [vaultResumePrompt, setVaultResumePrompt] = useState(false);
+  /** 凭据库状态是否真的读到过一次：启动探测要等它，否则会把「还没读到」当成「未初始化」 */
+  const [vaultReady, setVaultReady] = useState(false);
+  /** 会话列表是否读到过一次：启动探测要用会话的认证方式判断要不要先解锁 */
+  const [sessionsReady, setSessionsReady] = useState(false);
   /** 各连接目标（用户名@主机:端口）工作目录，由终端 OSC 7 上报，供文件分页跟随 */
   const [cwdByTarget, setCwdByTarget] = useState<Record<string, string>>({});
   /** 后端持久化的应用设置；按钮/滑块改动都先落到这里再写库 */
@@ -638,6 +705,10 @@ function App() {
       setSessions(sessionList);
     } catch (err) {
       setNotice({ tone: "error", text: errorMessage(err) });
+    } finally {
+      // 成败都放行：读不到会话列表时启动探测按「判断不出要用凭据库」处理，
+      // 不会一直卡在等就绪上
+      setSessionsReady(true);
     }
   }, []);
 
@@ -717,6 +788,9 @@ function App() {
       setCredentials(list);
     } catch (err) {
       setVaultError(errorMessage(err));
+    } finally {
+      // 读失败也放行：启动探测会把「没读到状态」当成未初始化，走延迟兜底尝试
+      setVaultReady(true);
     }
   }, []);
 
@@ -1305,24 +1379,76 @@ function App() {
   );
 
   /**
+   * 启动隧道的前置检查：需要凭据库但还锁着时，先把解锁框请出来。
+   *
+   * 参数：ids 为本次想启动的隧道配置 id（单条传一个元素的数组，批量传整批）；
+   * options.fromList 表示这次启动来自隧道列表，解锁后要把列表放回去。
+   * 核心流程：库已解锁直接放行（不读配置、不打扰用户）；否则拉一次配置，
+   * 按 config.sessionId 找到会话，用 sessionNeedsVault 判断这些隧道里是否有要取库里的
+   * 密码/私钥口令的。有且库还锁着（未初始化也算）就记下整批待启动的 id、弹一次解锁框并
+   * 返回 true —— 调用方立即返回，既不发起 tunnel_start，也不写错误提示。
+   * 记的是整批而不是只记「需要库的那几条」：列表被解锁框顶掉后没人能接着跑剩下的，
+   * 只记一部分会让用户点了「全部启动」却只起来一半。
+   * 配置读不到、或会话已被删（配置成了孤儿）时返回 false，交回原有报错路径，
+   * 后端会给出明确原因，不会为一个不存在的会话误弹解锁框。
+   */
+  const deferTunnelStartsForVault = useCallback(
+    async (ids: string[], options?: { fromList?: boolean }): Promise<boolean> => {
+      if (vault.unlocked || ids.length === 0) return false;
+      let configs: TunnelConfig[];
+      try {
+        configs = await tunnelConfigList();
+      } catch (err) {
+        console.warn("启动前置检查：读取隧道配置失败，按原路径启动", err);
+        return false;
+      }
+      const needsVault = ids.some((id) => {
+        const config = configs.find((item) => item.id === id);
+        if (!config) return false;
+        const session = sessions.find((item) => item.id === config.sessionId);
+        return session ? sessionNeedsVault(session) : false;
+      });
+      if (!needsVault) return false;
+      pendingTunnelStarts.current = [...ids];
+      pendingTunnelStartsFromList.current = options?.fromList === true;
+      setVaultError(null);
+      setDialog({ kind: "vault" });
+      return true;
+    },
+    [vault.unlocked, sessions],
+  );
+
+  /**
    * 从命令面板启动一条隧道。
    *
-   * 参数：id 为隧道配置 id
+   * 参数：id 为隧道配置 id，options.silent 表示「不是用户主动点的」（自动启动用）：
+   * 全程不写状态栏、不弹指纹确认，失败只落 console.warn。
    * 核心流程：与隧道列表弹窗同一套语义（只读参考 TunnelDialog 的私有实现，不 import）：
    * 先直接 tunnel_start；只有 kind=hostKeyUnknown 且带 detail 时复用 requestHostKeyTrust
    * 弹指纹确认，用户信任后重试一次，重试再失败只报原始错误；用户取消则停在取消文案。
-   * 结果统一写状态栏 notice（项目没有 toast，也不用原生 alert）并同时落 console.error。
+   * 结果统一写状态栏 notice（项目没有 toast，也不用原生 alert）并同时落 console.error；
+   * silent 时只留控制台，避免应用启动阶段突然弹窗或改状态栏打扰用户。
+   * 用户主动启动（非 silent）时先过一道前置检查：目标会话要从保险库取密码/口令而库
+   * 还锁着，就改成弹解锁框并在解锁后由续跑 effect 重新调一次本函数，而不是直接报错。
    */
   const startTunnel = useCallback(
-    async (id: string) => {
+    async (id: string, options?: { silent?: boolean }) => {
+      const silent = options?.silent === true;
+      if (!silent && (await deferTunnelStartsForVault([id]))) return;
       try {
         const runtime = await tunnelStart(id);
+        if (silent) return;
         setNotice({
           tone: "info",
           text: `隧道已启动：${runtime.name ? `${runtime.name} ` : ""}${runtime.listenHost}:${runtime.listenPort}`,
         });
       } catch (err) {
         const detail = errorKind(err) === "hostKeyUnknown" ? errorDetail<HostKeyInfo>(err) : null;
+        if (silent) {
+          // 自动启动不弹指纹确认：用户没在等这次连接，突然弹窗只会被打断
+          console.warn("隧道自动启动失败", id, detail ? "主机指纹未知，需手动启动确认" : err);
+          return;
+        }
         if (!detail) {
           console.error("隧道启动失败", id, err);
           setNotice({ tone: "error", text: `隧道启动失败：${errorMessage(err)}` });
@@ -1345,8 +1471,176 @@ function App() {
         }
       }
     },
-    [requestHostKeyTrust],
+    [requestHostKeyTrust, deferTunnelStartsForVault],
   );
+
+  /**
+   * 自动启动一轮：把所有标了 autoStart 的隧道按顺序拉起来。
+   *
+   * 参数：无
+   * 核心流程：先拉配置与运行态；已经在跑的跳过（用户的会话不该被重启），
+   * 其余逐条串行 await（同时建多条 SSH 会把凭据库/网络打满）。
+   * 单条失败只 console.warn 继续下一条；全程不写状态栏、不弹窗：用户没主动点，
+   * 失败静默跳过才不打扰人，全部成功也不提示。
+   */
+  const runAutoStartTunnels = useCallback(async () => {
+    let configs: TunnelConfig[];
+    try {
+      configs = await tunnelConfigList();
+    } catch (err) {
+      console.warn("自动启动：读取隧道配置失败，跳过本轮", err);
+      return;
+    }
+
+    const targets = configs.filter((config) => config.autoStart === true);
+    if (targets.length === 0) return;
+
+    // 运行态读不到就当作都没在跑：后端对已运行的隧道会自己报错，静默跳过即可
+    let runtime: TunnelInfo[] = [];
+    try {
+      runtime = await tunnelList();
+    } catch (err) {
+      console.warn("自动启动：读取隧道运行态失败，仍尝试启动", err);
+    }
+    const running = new Set(runtime.filter((item) => item.running).map((item) => item.id));
+
+    for (const config of targets) {
+      if (running.has(config.id)) continue;
+      await startTunnel(config.id, { silent: true });
+    }
+  }, [startTunnel]);
+
+  /**
+   * 启动探测 + 自动启动：有自动启动的隧道、而凭据库还锁着时，主动请用户解锁。
+   *
+   * 参数：无（取自 settings / sessions / vault 状态）
+   * 核心流程：
+   * 1. 等设置、会话列表、凭据库状态都读到过再动手 —— 否则会把「还没读到」
+   *    当成「没配自动启动 / 没设过主密码」；
+   * 2. 拉隧道配置，没有 autoStart === true 的直接收工（不弹、不提示、不启动）；
+   * 3. 有的话按配置里的 sessionId 找到会话，用 sessionNeedsVault 判断这批隧道
+   *    要不要用库里的密码/私钥口令：
+   *    - 需要且库锁着 -> 弹解锁框，阶段停在 awaitingVault，解锁成功后由下面那个
+   *      effect 续上自动启动（用户就知道为什么要输密码了）；
+   *    - 不需要（纯密钥且无口令）或库已解锁 -> 直接跑，不弹窗；
+   *    - 未初始化（没设过主密码）-> 不弹，退回延迟几秒的兜底尝试，静默失败即可。
+   * 幂等靠 autoStartPhase 这个 ref：只有 idle 能进入探测，探测过之后任何重渲染
+   * 都不再弹窗、不再重复启动。
+   */
+  useEffect(() => {
+    if (autoStartPhase.current !== "idle") return;
+    if (!settingsReady || !vaultReady || !sessionsReady) return;
+    autoStartPhase.current = "probing";
+    void (async () => {
+      let targets: TunnelConfig[];
+      try {
+        const configs = await tunnelConfigList();
+        targets = configs.filter((config) => config.autoStart === true);
+      } catch (err) {
+        console.warn("自动启动：读取隧道配置失败，跳过本轮", err);
+        autoStartPhase.current = "done";
+        return;
+      }
+
+      // 没有自动启动的隧道 -> 什么都不做，用户看不到任何变化
+      if (targets.length === 0) {
+        autoStartPhase.current = "done";
+        return;
+      }
+
+      // 隧道只记 sessionId，会话的认证方式才说明要不要从库里取密码/口令
+      const needsVault = targets.some((config) => {
+        const session = sessions.find((item) => item.id === config.sessionId);
+        return session ? sessionNeedsVault(session) : false;
+      });
+
+      if (vault.initialized && !vault.unlocked && needsVault) {
+        // 主动弹解锁框：这次是应用自己请用户输密码，所以带上条数说明
+        autoStartPhase.current = "awaitingVault";
+        setAutoStartVaultHint(targets.length);
+        setVaultError(null);
+        setDialog({ kind: "vault" });
+        return;
+      }
+
+      autoStartPhase.current = "done";
+      if (vault.unlocked) {
+        void runAutoStartTunnels();
+        return;
+      }
+      // 没设过主密码或这批隧道不碰库：等应用安静下来再试一次，失败静默跳过
+      window.setTimeout(() => void runAutoStartTunnels(), AUTO_START_FALLBACK_DELAY);
+    })();
+  }, [
+    settingsReady,
+    vaultReady,
+    sessionsReady,
+    sessions,
+    vault.initialized,
+    vault.unlocked,
+    runAutoStartTunnels,
+  ]);
+
+  /**
+   * 解锁成功后把自动启动续上。
+   *
+   * 参数：无（取自 vault.unlocked 与 autoStartVaultHint）
+   * 核心流程：阶段停在 awaitingVault（启动探测弹过解锁框）时，解锁成功就收掉弹窗、
+   * 立刻跑一轮自动启动；阶段是 declined 说明用户当时关掉了那个弹窗 ——
+   * declined 只表示「本次会话别再自动弹」，用户自己手动解锁后仍然允许跑，
+   * 所以这里把两种情况一起收尾，剩下的交给 runAutoStartTunnels。
+   * 依赖里带上 autoStartVaultHint：万一探测读到的是稍早的「还锁着」，弹窗与解锁
+   * 撞在同一瞬间，这条 hint 的变化能让本轮也补上一次判断，不至于卡住不启动。
+   */
+  useEffect(() => {
+    const phase = autoStartPhase.current;
+    if (phase !== "awaitingVault" && phase !== "declined") return;
+    if (!vault.unlocked) return;
+    autoStartPhase.current = "done";
+    setAutoStartVaultHint(null);
+    if (phase === "awaitingVault") {
+      // 这次解锁就是为自动启动输的密码 -> 顺手收掉弹窗，直接看着隧道连上
+      setDialog((prev) => (prev.kind === "vault" ? { kind: "none" } : prev));
+    }
+    void runAutoStartTunnels();
+  }, [vault.unlocked, autoStartVaultHint, runAutoStartTunnels]);
+
+  /**
+   * 解锁成功后把被前置检查拦下的那批隧道启动续上。
+   *
+   * 参数：无（取自 vault.unlocked 与 pendingTunnelStarts）
+   * 核心流程：解锁成功且确实有一批待办时，先取出并清空标记、顺手清掉「来自列表」
+   * 的标记（只续跑一次，后续任何重渲染都不会重复启动），再决定弹窗去哪：
+   * 从隧道列表发起的那次把列表放回去（用户能立刻看到隧道变成运行中），
+   * 命令面板 / 其它发起方式只收掉解锁框，不硬塞一个列表出来。
+   * 最后串行逐条走一遍用户当初的 startTunnel —— 这次库已解锁，前置检查直接放行，
+   * 结果照常写状态栏；单条抛错只记控制台，不打断后面几条（与批量启动同一语义）。
+   * 跑完 bump 一次 tunnelRevision，让刚挂回去的列表拉到最新运行态。
+   * 与自动启动互不相干：这里不碰 autoStartPhase / autoStartVaultHint，
+   * 那个 effect 也不碰 pendingTunnelStarts，两条流程可以同时挂着。
+   */
+  useEffect(() => {
+    if (!vault.unlocked) return;
+    const ids = pendingTunnelStarts.current;
+    if (ids.length === 0) return;
+    pendingTunnelStarts.current = [];
+    const backToList = pendingTunnelStartsFromList.current;
+    pendingTunnelStartsFromList.current = false;
+    setDialog((prev) => {
+      if (prev.kind !== "vault") return prev;
+      return backToList ? { kind: "tunnel" } : { kind: "none" };
+    });
+    void (async () => {
+      for (const id of ids) {
+        try {
+          await startTunnel(id);
+        } catch (err) {
+          console.error("隧道启动续跑失败", id, err);
+        }
+      }
+      if (backToList) setTunnelRevision((value) => value + 1);
+    })();
+  }, [vault.unlocked, startTunnel]);
 
   /**
    * 面板打开时才拉隧道配置。
@@ -2635,6 +2929,8 @@ function App() {
                       onHostKeyMismatch={handleHostKeyMismatch}
                       onCwdChange={handleCwdChange}
                       onTerminalId={handleTerminalId}
+                      banner={settings.terminalBanner}
+                      followCwd={settings.sftpFollowCwd}
                     />
                   </div>
                   {split && (
@@ -2653,6 +2949,8 @@ function App() {
                         onHostKeyMismatch={handleHostKeyMismatch}
                         onCwdChange={handleCwdChange}
                         onTerminalId={handleTerminalId}
+                        banner={settings.terminalBanner}
+                        followCwd={settings.sftpFollowCwd}
                         onClosePane={() => toggleSplit(tab.id)}
                       />
                     </div>
@@ -3094,6 +3392,7 @@ function App() {
           onConfirmHostKey={requestHostKeyTrust}
           onOpenForm={(config) => setDialog({ kind: "tunnelForm", config })}
           onNotify={(text) => setNotice({ tone: "info", text })}
+          needsVaultBeforeStart={(ids) => deferTunnelStartsForVault(ids, { fromList: true })}
           onClose={() => setDialog({ kind: "none" })}
         />
       )}
@@ -3196,7 +3495,19 @@ function App() {
             })
           }
           onDelete={(id) => void runVaultAction(() => credentialDelete(id).then(() => undefined))}
+          autoStartCount={autoStartVaultHint ?? undefined}
           onClose={() => {
+            // 启动探测主动弹的那次被关掉 -> 本次会话不再自动弹；只影响「弹窗」，
+            // 用户之后自己解锁仍会触发自动启动（见阶段 declined 的处理）
+            if (autoStartPhase.current === "awaitingVault") {
+              autoStartPhase.current = "declined";
+            }
+            // 为用户主动启动弹的解锁框被关掉 -> 静默丢弃这批启动：用户已经用
+            // 「关闭」表达不想输密码，再甩一句错误只会添乱；顺手清掉「来自列表」
+            // 的标记，免得事后再突然弹一个隧道列表出来
+            pendingTunnelStarts.current = [];
+            pendingTunnelStartsFromList.current = false;
+            setAutoStartVaultHint(null);
             setPendingVaultOpen(null);
             setVaultResumePrompt(false);
             setDialog({ kind: "none" });

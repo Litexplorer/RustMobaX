@@ -13,6 +13,11 @@ type Props = {
   onLock: () => void;
   onSave: (label: string, secret: string) => void;
   onDelete: (id: string) => void;
+  /**
+   * 启动探测主动弹起时带上：有多少条隧道在等解锁后自动连接。
+   * 不传表示这次弹窗不是自动启动拉起来的，界面上不显示任何说明。
+   */
+  autoStartCount?: number;
   onClose: () => void;
 };
 
@@ -24,8 +29,19 @@ type Props = {
  * 已解锁时管理凭据；明文只在输入框里短暂存在，提交后由后端加密落库。
  */
 export function VaultDialog(props: Props) {
-  const { status, credentials, busy, error, onSetup, onUnlock, onSave, onDelete, onLock, onClose } =
-    props;
+  const {
+    status,
+    credentials,
+    busy,
+    error,
+    onSetup,
+    onUnlock,
+    onSave,
+    onDelete,
+    onLock,
+    autoStartCount,
+    onClose,
+  } = props;
   // Esc = 关闭（与标题栏 × 一致）；请求在飞时底部的「关闭」是禁用的，Esc 也一并失效
   useEscapeClose(onClose, !busy);
   const [password, setPassword] = useState("");
@@ -104,6 +120,12 @@ export function VaultDialog(props: Props) {
             <p className="detail-empty">
               状态：{status.unlocked ? "已解锁" : "已锁定"}
               {status.unlocked && ` · ${credentials.length} 条凭据`}
+            </p>
+          )}
+
+          {!status.unlocked && autoStartCount !== undefined && autoStartCount > 0 && (
+            <p className="detail-empty">
+              有 {autoStartCount} 条隧道设置为自动启动，解锁后将自动连接。
             </p>
           )}
 

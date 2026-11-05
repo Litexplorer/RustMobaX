@@ -205,6 +205,9 @@ pub struct TunnelConfig {
     pub target_host: String,
     /// 目标端口，dynamic 类型可为 0。
     pub target_port: u16,
+    /// 是否在会话建立后自动拉起，库里存 0/1，缺省为不自动启动。
+    #[serde(default)]
+    pub auto_start: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -230,6 +233,9 @@ pub struct TunnelConfigInput {
     pub target_host: String,
     #[serde(default)]
     pub target_port: u16,
+    /// 老前端不传这个字段，反序列化时即为 false。
+    #[serde(default)]
+    pub auto_start: bool,
 }
 
 impl TunnelConfigInput {
@@ -413,5 +419,21 @@ mod tests {
         assert_eq!(Protocol::parse("gopher"), None);
         assert_eq!(Protocol::parse(""), None);
         assert_eq!(Protocol::parse("SSH"), None);
+    }
+
+    /// 老前端不传 autoStart 时入参反序列化为 false，显式传 true 才生效。
+    #[test]
+    fn tunnel_config_input_auto_start_defaults_to_false() {
+        let without = r#"{"sessionId":"s-1","kind":"local"}"#;
+        let parsed: TunnelConfigInput = serde_json::from_str(without).unwrap();
+        assert!(!parsed.auto_start, "缺省时不自动启动");
+
+        let with = r#"{"sessionId":"s-1","kind":"local","autoStart":true}"#;
+        let parsed: TunnelConfigInput = serde_json::from_str(with).unwrap();
+        assert!(parsed.auto_start);
+
+        // 输出侧同样是 camelCase，前端读得到 autoStart
+        let json = serde_json::to_string(&parsed).unwrap();
+        assert!(json.contains("\"autoStart\":true"), "{json}");
     }
 }

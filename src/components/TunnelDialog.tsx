@@ -5,6 +5,7 @@ import type { HostKeyInfo } from "../api/terminal";
 import {
   tunnelConfigDelete,
   tunnelConfigList,
+  tunnelConfigUpdate,
   tunnelList,
   tunnelStart,
   tunnelStop,
@@ -29,6 +30,15 @@ type Props = {
   onOpenForm: (config: TunnelConfig | null) => void;
   /** 成功类提示回传到主界面状态栏 */
   onNotify: (text: string) => void;
+  /**
+   * 启动前置检查：由父层统一判断「这批隧道要不要先解锁凭据库」。
+   *
+   * 参数 tunnelIds 为本次想启动的隧道 id（行内启动传一个，全部启动传整批）。
+   * 返回 true 表示父层已改成弹出解锁框接管这批启动：调用方不要再调 tunnel_start，
+   * 也不要贴错误提示或占着过渡态（解锁成功后由父层自己把这批启动续上）。
+   * 整批一次问完，批量启动因此只会弹一次解锁框。
+   */
+  needsVaultBeforeStart: (tunnelIds: string[]) => Promise<boolean>;
   onClose: () => void;
 };
 
@@ -48,6 +58,14 @@ type Row = {
 
 /** 每行正在进行的动作，键为配置 id：用来做过渡态并阻止重复点击。 */
 type PendingMap = Record<string, "start" | "stop" | undefined>;
+
+/**
+ * 每行「自动启动」开关是否正在提交，键为配置 id。
+ *
+ * 与 PendingMap 分开存：开关只改配置、不动运行态，不该让状态列显示「启动中…」，
+ * 也不该因为它在提交就把同一行的启停按钮判成忙。
+ */
+type AutoPendingMap = Record<string, boolean | undefined>;
 
 type Banner = { tone: "info" | "error"; text: string };
 
@@ -170,7 +188,8 @@ function mergeRows(configs: TunnelConfig[], runtime: TunnelInfo[]): Row[] {
  * 所有失败原因都用单行提示条就地显示，不弹原生 alert。
  */
 export function TunnelDialog(props: Props) {
-  const { revision, onOpenForm, onNotify, onClose, onConfirmHostKey } = props;
+  const { revision, onOpenForm, onNotify, onClose, onConfirmHostKey, needsVaultBeforeStart } =
+    props;
 
   // Esc = 关闭列表；叠在它上面的表单 / 删除确认会自己入栈成为栈顶，
   // 所以连按 Esc 是「先关上层，再关列表」
@@ -179,6 +198,7 @@ export function TunnelDialog(props: Props) {
   const [rows, setRows] = useState<Row[]>([]);
   const [loading, setLoading] = useState(true);
   const [pending, setPending] = useState<PendingMap>({});
+  const [autoPending, setAutoPending] = useState<AutoPendingMap>({});
   const [banner, setBanner] = useState<Banner | null>(null);
   /** 待确认删除的行，非空时叠加 ConfirmDialog */
   const [confirming, setConfirming] = useState<Row | null>(null);
@@ -269,14 +289,17 @@ export function TunnelDialog(props: Props) {
    * 启动一条隧道。
    *
    * 参数：row 为目标行
-   * 核心流程：行内按钮走这条路径；未知主机指纹会拉起 HostKeyDialog，
-   * 取消或失败的原因（例如「凭据库未解锁」）都贴在提示条里，行回到「已停止」。
+   * 核心流程：行内按钮走这条路径；先问一次父层要不要先解锁凭据库 ——
+   * 要的话父层弹出解锁框并接管这次启动，本行直接收尾（过渡态在 finally 里复原，
+   * 不会卡在「启动中…」）。之后才是未知主机指纹拉起 HostKeyDialog，
+   * 取消或失败的原因都贴在提示条里，行回到「已停止」。
    */
   const startOne = async (row: Row) => {
     if (pending[row.id] || busy) return;
     setBanner(null);
     mark(row.id, "start");
     try {
+      if (await needsVaultBeforeStart([row.id])) return;
       const outcome = await startWithHostKey(row.id, onConfirmHostKey);
       if (!outcome.ok) {
         setBanner({ tone: "error", text: outcome.message });
@@ -311,11 +334,47 @@ export function TunnelDialog(props: Props) {
   };
 
   /**
+   * 切换一条配置的「自动启动」。
+   *
+   * 参数：row 为目标行
+   * 核心流程：只改配置、不动运行态，因此不走 PendingMap（状态列不会闪「启动中…」，
+   * 同行的启停按钮也不会因为它在提交而变灰）。成功后用后端返回值就地替换该行 config ——
+   * 列表开关与之后打开的编辑表单读的都是同一份数据，两边不会打架；
+   * 失败只把原因贴到列表提示条，不动本地状态。孤儿行没有配置可改，不渲染开关。
+   */
+  const toggleAutoStart = async (row: Row) => {
+    const config = row.config;
+    if (!config || autoPending[row.id]) return;
+    const wanted = config.autoStart !== true;
+    setBanner(null);
+    setAutoPending((prev) => ({ ...prev, [row.id]: true }));
+    try {
+      // 整条覆盖式更新：把现有字段原样带上，只翻转 autoStart
+      const saved = await tunnelConfigUpdate(config.id, { ...config, autoStart: wanted });
+      setRows((prev) =>
+        prev.map((item) => (item.id === saved.id ? { ...item, config: saved } : item)),
+      );
+      onNotify(`已${wanted ? "开启" : "关闭"}自动启动：${row.name || row.id}`);
+    } catch (err) {
+      setBanner({ tone: "error", text: errorMessage(err) });
+    } finally {
+      setAutoPending((prev) => {
+        const rest = { ...prev };
+        delete rest[row.id];
+        return rest;
+      });
+    }
+  };
+
+  /**
    * 全部启动。
    *
    * 参数：无
    * 核心流程：串行逐条启动，单条失败只记下来不打断后面的，最后汇总成一条提示；
    * 串行还能让失败原因指向具体名字，也避免同时建多条连接。
+   * 整批启动前先问一次父层要不要解锁凭据库：要的话一次性把这批 id 交出去，
+   * 父层弹一次解锁框并接管全部启动，本函数直接收尾 —— 既不会每条弹一次，
+   * 也不会给被拦下的行留下「启动中…」的过渡态（此时还没 mark 任何行）。
    */
   const startAll = async () => {
     const targets = rows.filter((row) => row.config !== null && !row.running);
@@ -324,6 +383,8 @@ export function TunnelDialog(props: Props) {
       return;
     }
     setBanner(null);
+    // 先问解锁再上过渡态：被拦下时列表已被解锁框顶掉，挂着的「启动中…」没人会去复原
+    if (await needsVaultBeforeStart(targets.map((row) => row.id))) return;
     let ok = 0;
     const failures: string[] = [];
     for (const row of targets) {
@@ -506,8 +567,31 @@ export function TunnelDialog(props: Props) {
                           </span>
                         </td>
                         <td className="tunnel-col-name">
-                          <span className="tunnel-name" title={row.name || "(未命名)"}>
-                            {row.name === "" ? "(未命名)" : row.name}
+                          {/* 名称收紧 + 自动启动开关：开关 flex:none，名字超长仍按 ellipsis 截断，
+                              不新增列也不改变行高；两态只换颜色与边框，字号/内边距/文字都不变，
+                              所以整个胶囊宽度不变，列宽不会被带动 */}
+                          <span className="tunnel-name-wrap">
+                            <span className="tunnel-name" title={row.name || "(未命名)"}>
+                              {row.name === "" ? "(未命名)" : row.name}
+                            </span>
+                            {row.config !== null && (
+                              <button
+                                type="button"
+                                className={`tunnel-auto-tag is-${
+                                  row.config.autoStart === true ? "on" : "off"
+                                }`}
+                                aria-pressed={row.config.autoStart === true}
+                                disabled={autoPending[row.id] === true}
+                                title={
+                                  row.config.autoStart === true
+                                    ? "已开启自动启动，点击关闭"
+                                    : "点击开启自动启动（启动应用时自动连接）"
+                                }
+                                onClick={() => void toggleAutoStart(row)}
+                              >
+                                自动
+                              </button>
+                            )}
                           </span>
                         </td>
                         <td className="tunnel-col-kind">{kindLabel(row.kind)}</td>

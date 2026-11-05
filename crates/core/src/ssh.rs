@@ -43,33 +43,38 @@ const SHELL_PROBE_COMMAND: &str = r#"printf '%s\n' "$SHELL" "$0""#;
 /// 探测输出的接收上限。
 const SHELL_PROBE_MAX_BYTES: usize = 256;
 
-/// 注入前等 shell 开口的总时长上限。
+/// 开完 shell 到「它停在提示符上」的总时长上限。
 ///
 /// 参数：无
 /// 核心流程：远端还在跑 .bashrc 时写进 PTY 的字节会被内核原样回显，
-/// 所以要等它先说话；等不到就放弃注入（一个字节都不写），绝不为此拖住连接。
-/// 取值要盖得住「重 .bashrc」：正常登录本来就等到这句提示符才算能用，
-/// 所以这段等待不会额外拖慢感知；真正拿不到输出时最多白等这么久。
+/// 所以要等它先把话说完；等不到就放弃注入（一个字节都不写），绝不为此拖住连接。
+/// 这段等待同时也是「探测 shell 类型」与「收首个 session 的 motd」的窗口 ——
+/// 三者并发进行，所以这个上限要盖得住「重 .bashrc」：正常登录本来也要等到提示符才算能用。
+/// 取值要盖得住探测（1.5 秒上限）：拿不到输出时最多白等这么久。
 const SHELL_READY_TIMEOUT: Duration = Duration::from_millis(4000);
 
 /// 一段输出之后静默多久算「shell 已经把话说完、停在提示符上」。
 ///
 /// 参数：无
 /// 核心流程：远端跑启动脚本时是一阵一阵地输出，用这段静默当「已经到提示符」的判据。
+/// 首批输出（motd）可能早就在缓冲里了，所以判据是「距最后一段输出静默满这么久」，
+/// 而不是「从这一刻起还等不等得到新输出」。
 const SHELL_READY_QUIET: Duration = Duration::from_millis(250);
 
-/// 关回显之后等「它真的执行了」的证据（下一句提示符）的上限。
+/// 注入窗口的时长上限（每一段窗口各算一次）。
 ///
 /// 参数：无
-/// 核心流程：拿不到证据就不注入，改为把回显原地恢复，
-/// 免得把用户留在一个「看不见自己打字」的终端里。
-const ECHO_OFF_TIMEOUT: Duration = Duration::from_millis(700);
+/// 核心流程：窗口内读到的字节一律不送前端，所以必须有兜底 —— 慢 shell 上
+/// 等不到提示符就按这个上限收手，把后续字节交还给正常转发，
+/// 绝不让「吞输出」变成永久状态。整段注入最多两段窗口，最坏多花约 4 秒。
+const INJECT_WINDOW_TIMEOUT: Duration = Duration::from_millis(2000);
 
 /// 临时关掉远端 PTY 回显的那一行。
 ///
 /// 参数：无
-/// 核心流程：整个注入过程中唯一可能被用户看到的就是这一行；
-/// 之后所有字节都在回显关闭期间发送，所以注入语句本身永远不该出现在屏幕上。
+/// 核心流程：这一行写下去会被行编辑器回显，但那段回显落在注入窗口里被丢弃，
+/// 所以它不会出现在屏幕上；关回显是为了让后面那句注入命令尽量不被回显
+/// （bash 的 readline 会自己接管回显，所以这一步不能当成唯一保障）。
 /// `2>/dev/null` 兜住「拿不到 tty 时 stty 报错」的情况。
 const ECHO_OFF_LINE: &str = "stty -echo 2>/dev/null";
 
@@ -79,13 +84,6 @@ const ECHO_OFF_LINE: &str = "stty -echo 2>/dev/null";
 /// 核心流程：和注入语句写在同一条命令里，保证「装钩子」与「恢复回显」同生共死，
 /// 不会出现钩子装上了、回显却没恢复（用户看不见自己打字）的状态。
 const ECHO_RESTORE: &str = "stty echo";
-
-/// 估算提示符宽度时留的余量（列）。
-///
-/// 参数：无
-/// 核心流程：提示符宽度拿不到（它在远端 PS1 里，可以是任意字节），
-/// 按 40 列留量估折行；估多了只是多擦一行登录 banner，估少了会留下半行命令回显。
-const PROMPT_ALLOWANCE: usize = 40;
 
 /// 连接上开出的一个通道。
 ///
@@ -97,13 +95,14 @@ pub type SshChannel = russh::Channel<client::Msg>;
 /// 刚开好的交互式 shell。
 ///
 /// 无参数
-/// 核心流程：把通道和「注入钩子期间已经读到的远端输出」一起交回去 ——
-/// 装 OSC 7 钩子前必须先等 shell 开口，那段时间读到的登录 banner 与提示符
-/// 必须原样还给上层，一个字节都不能吞。
+/// 核心流程：把通道和「注入钩子之前已经读到的远端输出」一起交回去 ——
+/// 装 OSC 7 钩子前必须先等 shell 开口，那段时间读到的登录 banner、motd 全文
+/// （含颜色序列）与提示符必须原样还给上层，一个字节都不能吞；
+/// 注入窗口（从关回显起）里读到的回显字节则一律丢掉。
 pub struct OpenedShell {
     /// 通道本身，调用方独占读写。
     pub channel: SshChannel,
-    /// 注入之前就读到的输出，按原顺序先灌进输出泵。
+    /// 注入窗口之前读到的输出（motd + 提示符），按原顺序先灌进输出泵。
     pub pending: Vec<u8>,
 }
 
@@ -628,15 +627,16 @@ impl SshConnection {
     /// 在连接上开一个交互式 shell 通道。
     ///
     /// 参数：term 为终端类型，cols/rows 为初始尺寸
-    /// 核心流程：先探一次远端登录 shell（不认识就彻底不碰写入路径）→
-    /// 开 session channel → 请求 PTY → 请求 shell →
-    /// 给 bash/zsh 装上 OSC 7 提示符钩子（让远端 shell 自己报当前目录）；
+    /// 核心流程：**先开交互 shell 通道**（`channel_open_session` → PTY → shell）→
+    /// **再**用第二个 session 探远端登录 shell → 给 bash/zsh 装上 OSC 7 提示符钩子。
+    /// 顺序不能反：PAM 的 motd 只发给本连接上的**第一个** session，
+    /// 若让探测用的 exec 通道抢先，motd 会被它吃掉并丢弃，交互 shell（第二个 session）
+    /// 永远拿不回那段文字。探测期间 shell 通道上的字节（motd 全文 + 提示符）
+    /// 全部缓冲在 pending 里、一个都不丢，注入窗口里的回显则照旧吞掉；
+    /// 探测失败或 shell 不支持时一个字节都不写，motd 与 shell 照常可用。
     /// 前三步各有独立的失败文案，成功后通道由调用方独占。
     pub async fn open_shell(&self, term: &str, cols: u16, rows: u16) -> CoreResult<OpenedShell> {
-        // 先探 shell：探测走独立 exec 通道，和 shell 通道互不干扰；
-        // 结果决定后面要不要等它开口以及要不要注入
-        let shell = detect_remote_shell(&self.handle).await;
-
+        // 1) 先把交互 shell 通道占住「首个 session」的位置：motd 归它
         let mut channel = self
             .handle
             .channel_open_session()
@@ -653,10 +653,19 @@ impl SshConnection {
             .await
             .map_err(|err| CoreError::Ssh(format!("启动 shell 失败：{err}")))?;
 
-        // 注入期间读到的输出先攒着 -> 收尾时原样交给上层，登录 banner 不能丢；
-        // 注入失败/不支持一律静默跳过 -> 终端本身照常可用
+        // 2) 探测（第二个 session，此时 motd 已经发完）与 shell 通道的读取并发进行：
+        //    shell 一开就会吐 motd 然后停在提示符上，这段字节必须边收边攒、绝不丢弃
         let mut pending = Vec::new();
-        install_cwd_hook(&mut channel, shell, cols, &mut pending).await;
+        let (shell, ready) = buffer_shell_while_probing(
+            &mut channel,
+            &mut pending,
+            detect_remote_shell(&self.handle),
+        )
+        .await;
+
+        // 3) 探测结果决定要不要注入；窗口外的字节（motd 全文）已全部在 pending 里，
+        //    窗口内的回显由后端吞掉；探测失败/不支持 -> 静默跳过，终端本身照常可用
+        install_cwd_hook(&mut channel, shell, ready).await;
 
         Ok(OpenedShell { channel, pending })
     }
@@ -914,99 +923,129 @@ fn osc7_setup_script(shell: RemoteShell) -> Option<String> {
 
 /// 生成一次注入要写进 PTY 的整行内容。
 ///
-/// 参数：shell 为探测到的 shell 类型，cols 为终端列数
-/// 核心流程：装钩子 → 立刻恢复回显 → 擦掉唯一被看见的那行 stty。
-/// 三件事写在同一行里，shell 会按顺序执行：即使中间被打断，
-/// 也不会出现「钩子装上了但回显还关着」的状态。
-fn cwd_hook_payload(shell: RemoteShell, cols: u16) -> Option<String> {
+/// 参数：shell 为探测到的 shell 类型
+/// 核心流程：装钩子 → 立刻恢复回显。两件事写在同一行里，shell 会按顺序执行：
+/// 即使中间被打断，也不会出现「钩子装上了但回显还关着」的状态。
+/// 这一行不含任何擦行/上移的 ANSI 序列 —— 屏幕上的痕迹靠“注入窗口丢字节”消除，
+/// 不靠猜行数去擦（猜多了会把 motd 一起吃掉）。
+fn cwd_hook_payload(shell: RemoteShell) -> Option<String> {
     let script = osc7_setup_script(shell)?;
-    Some(format!(
-        "{script}; {ECHO_RESTORE}; {}",
-        osc7_clear_sequence(cols, 2)
-    ))
-}
-
-/// 生成擦掉注入痕迹的语句。
-///
-/// 参数：cols 为终端列数，extra_rows 为注入额外占用的行数
-/// 核心流程：从当前行起往上逐行 `\r\033[2K`（清行）+ `\033[1A`（上移）。
-/// 行数 = 关回显那行折出来的行数（按提示符留量 + 列宽算）+ extra_rows，
-/// 算多只会多擦一行登录 banner，算少才会留下命令回显 —— 所以宁可略多。
-fn osc7_clear_sequence(cols: u16, extra_rows: usize) -> String {
-    let cols = usize::from(cols.max(20));
-    let rows = (PROMPT_ALLOWANCE + ECHO_OFF_LINE.len()) / cols + 1 + extra_rows;
-    let mut sequence = String::from(r"printf '\r\033[2K");
-    for _ in 1..rows {
-        sequence.push_str(r"\033[1A\033[2K");
-    }
-    sequence.push_str(r"\r'");
-    sequence
+    Some(format!("{script}; {ECHO_RESTORE}"))
 }
 
 /// 给远端 shell 装上 OSC 7 提示符钩子。
 ///
 /// 参数：channel 为刚开好的 shell 通道，shell 为探测到的 shell 类型，
-/// cols 为终端列数，pending 用来攒注入期间读到的输出
-/// 核心流程：写入的字节一旦赶上远端 shell 还在跑 .bashrc，PTY 的回显就会把
-/// 脚本原文原封不动印到屏幕上（这正是要修的现象）。所以分四步：
-/// 1. 先等 shell 自己开口并静默下来（说明它已经走到提示符）；
-/// 2. 发 `stty -echo` 关回显 —— 这是唯一可能被看见的一行；
-/// 3. 等下一句提示符，证明回显真的关了（只看得到自己那行的回显不算证据）；
-/// 4. 发「装钩子 + 恢复回显 + 擦行」。
+/// ready 为「shell 已经开口并静默下来（停在提示符上）」的证据（由
+/// `buffer_shell_while_probing` 顺带判出来）
+/// 核心流程：写进 PTY 的命令一定会被行编辑器回显（bash 的 readline 自己接管回显，
+/// `stty -echo` 都拦不住），把回显再从屏幕上擦掉是不可能的 —— 这正是一次次擦不干净的原因。
+/// 所以换个方向：**注入窗口内读到的字节一律不送前端**，让后端自己把回显吃掉。
+/// 1. 不认识的 shell、或拿不到「已经停在提示符上」的证据 -> 一个字节都不写；
+/// 2. 从关回显那一行开始进入注入窗口；
+/// 3. 窗口里读到「除了自己那行回显之外的提示符」才算回显真的关了 -> 窗口关闭；
+/// 4. 发「装钩子 + 恢复回显」，它的回显同样落在第二段窗口里被丢掉。
 ///
+/// 窗口只按「看到提示符」关，不按固定字节数/固定时长猜；另有超时兜底，
+/// 超时就放弃剩余丢弃、恢复正常转发（慢 shell 上不会永久吞输出）。
 /// 任何一步拿不到证据就收手，并把回显恢复回来：终端可用性优先于目录跟随。
 /// 关回显只能借远端 shell 的 `stty`：这条 PTY 的 master 在 sshd 那台机器上，
 /// 本地既没有 fd 也没有 tcsetattr 的对象，pty-req 里的 mode 又是「服务端可以不理」的，
 /// 靠不住，所以用 shell 自己能执行的一条命令来关、再用同样一条命令恢复。
-/// 整段注入都在 `open_shell` 返回之前完成 -> 用户还没看到终端，插不进用户输入。
-async fn install_cwd_hook(
-    channel: &mut SshChannel,
-    shell: RemoteShell,
-    cols: u16,
-    pending: &mut Vec<u8>,
-) {
-    let Some(payload) = cwd_hook_payload(shell, cols) else {
+/// 整段注入都在 `open_shell` 返回之前完成 -> 前端还没拿到通道句柄，写不进用户输入，
+/// 所以这个窗口吞不到任何用户自己的字节。
+async fn install_cwd_hook(channel: &mut SshChannel, shell: RemoteShell, ready: bool) {
+    let Some(payload) = cwd_hook_payload(shell) else {
         return; // 不认识的 shell：一个字节都不发
     };
 
-    // 1) 等 shell 开口 + 静默下来（启动脚本跑完、停在提示符）
-    if !wait_for_output(channel, pending, SHELL_READY_TIMEOUT, SHELL_READY_QUIET).await {
+    // 1) 没等到 shell 停在提示符上（没开口 / 一直在输出）-> 一个字节都不写：
+    //    此时写进去会被回显，而窗口的判据还没建立
+    if !ready {
         return;
     }
 
-    // 2) 关回显：这一行本身会被行编辑器回显，所以它必须是能擦干净的一行短命令
+    // 2) 关回显；从这一句写下去起进入注入窗口：回显字节一律丢弃
     if !write_line(channel, ECHO_OFF_LINE).await {
         return;
     }
 
-    // 3) 等提示符：拿到「不是我自己的回显」的新输出，才算回显真的关了
-    let mut evidence = Vec::new();
-    let confirmed = wait_for_output(channel, &mut evidence, ECHO_OFF_TIMEOUT, SHELL_READY_QUIET).await
-        && has_prompt_after_echo(&evidence);
-    pending.extend_from_slice(&evidence);
-    if !confirmed {
-        // 没拿到证据：不注入，但必须把回显打开，绝不把用户留在看不见自己打字的状态
-        let abort = format!("{ECHO_RESTORE}; {}", osc7_clear_sequence(cols, 1));
-        let _ = write_line(channel, &abort).await;
+    // 3) 窗口关闭条件 = 看到提示符（自己那行回显不算证据）
+    if !swallow_until_prompt(channel, ECHO_OFF_LINE.as_bytes(), INJECT_WINDOW_TIMEOUT).await {
+        // 没拿到证据：钩子不装，只把回显打开（绝不把用户留在看不见自己打字的状态），
+        // 窗口已按超时结束 -> 后续字节照常转发，静默降级
+        let _ = write_line(channel, ECHO_RESTORE).await;
         return;
     }
 
-    // 4) 注入 + 恢复回显 + 擦行，一次写完 -> 中间插不进任何用户输入
-    let _ = write_line(channel, &payload).await;
+    // 4) 注入 + 恢复回显，一次写完 -> 中间插不进任何用户输入；
+    //    这一行自己的回显也落在第二段窗口里被丢掉，屏幕上不留任何痕迹
+    if !write_line(channel, &payload).await {
+        return;
+    }
+    let _ = swallow_until_prompt(channel, payload.as_bytes(), INJECT_WINDOW_TIMEOUT).await;
 }
 
-/// 判断关回显之后的输出里，除了我们自己那行的回显之外还有没有别的内容。
+/// 注入窗口：在窗口内读到远端输出，但一个字节都不交给前端。
 ///
-/// 参数：seen 为 `stty -echo` 之后读到的全部输出
+/// 参数：channel 为 shell 通道，own_echo 为我们刚写进去那行命令的字节，
+/// timeout 为这段窗口的时长上限
+/// 核心流程：边读边攒一块「窗口内看到的字节」，攒到的内容一旦能证明
+/// 「这行命令真的执行完了」（抠掉自己那行回显后还剩提示符这类实质内容）就关窗；
+/// 攒到的东西一律不 push —— 这正是把注入回显从屏幕上抹掉的办法。
+/// 超时/通道结束也照样关窗返回 false，调用方据此决定是降级还是继续装钩子。
+async fn swallow_until_prompt(
+    channel: &mut SshChannel,
+    own_echo: &[u8],
+    timeout: Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut seen = Vec::new();
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let remaining = deadline - now;
+        match tokio::time::timeout(remaining, channel.wait()).await {
+            // 窗口内的数据：只用于判断「执行完了没」，绝不外送
+            Ok(Some(ChannelMsg::Data { data })) => {
+                seen.extend_from_slice(&data);
+                if has_prompt_after_own_echo(&seen, own_echo) {
+                    return true;
+                }
+            }
+            Ok(Some(ChannelMsg::ExtendedData { data, .. })) => {
+                seen.extend_from_slice(&data);
+                if has_prompt_after_own_echo(&seen, own_echo) {
+                    return true;
+                }
+            }
+            // 通道自身的其他消息（窗口调整、退出码…）不是输出，继续等
+            Ok(Some(_)) => continue,
+            // 通道结束或到点：关窗，剩余字节交回正常转发
+            Ok(None) | Err(_) => return false,
+        }
+    }
+}
+
+/// 判断窗口内的输出里，除了我们自己那行命令的回显之外还有没有别的内容。
+///
+/// 参数：seen 为窗口里读到的全部字节，own_echo 为我们刚写进去那行命令的字节
 /// 核心流程：行编辑器会先回显我们刚敲的那一行，这段字节不能当成「shell 已经执行」的
-/// 证据；把它抠掉之后还有实质内容（提示符等），才说明那句 stty 真的跑完了。
-fn has_prompt_after_echo(seen: &[u8]) -> bool {
-    let echo = ECHO_OFF_LINE.as_bytes();
+/// 证据；把它抠掉之后还有实质内容（提示符等），才说明那行命令真的跑完了。
+/// 回显可能分片到达，所以「尾巴只是回显的开头」时不算证据，要再等更多字节。
+fn has_prompt_after_own_echo(seen: &[u8], own_echo: &[u8]) -> bool {
     let mut index = 0;
     while index < seen.len() {
-        if seen[index..].starts_with(echo) {
-            index += echo.len();
+        let rest = &seen[index..];
+        if rest.starts_with(own_echo) {
+            index += own_echo.len();
             continue;
+        }
+        // 还没收全的回显不算证据（否则会把「回显分片」误判成提示符）
+        if own_echo.starts_with(rest) {
+            return false;
         }
         if !matches!(seen[index], b'\r' | b'\n' | b'\t' | b' ') {
             return true;
@@ -1016,46 +1055,71 @@ fn has_prompt_after_echo(seen: &[u8]) -> bool {
     false
 }
 
-/// 等远端再开口说话。
+/// 边探测 shell 类型、边把 shell 通道上的输出缓冲下来。
 ///
-/// 参数：channel 为 shell 通道，sink 为读到的输出要追加到哪，timeout 为总时长上限，
-/// quiet 为「静默多久算它说完了」
-/// 核心流程：第一段数据要一直等到 timeout 到点（慢启动的 .bashrc 不能当成「不说话」）；
-/// 之后转为等静默 —— 静默满 quiet 就说明它已经停在提示符上。
-/// 读到的字节一律追加进 sink，绝不丢弃（登录 banner 必须还给用户）。
-/// 返回「这次到底有没有读到数据」。
-async fn wait_for_output(
+/// 参数：channel 为刚请求完 shell 的交互通道，pending 为缓冲（motd 等首批输出），
+/// probe 为探测远端 shell 类型的 future
+/// 核心流程：探测走**另一条** session 通道，而这条交互通道上的字节一个都不能丢 ——
+/// motd 是 PAM 在本连接首个 session 上一次性打出来的，错过就再也拿不回来；
+/// 所以这里让两件事并发：探测在等 RTT 的同时，把通道上到达的字节全部攒进 pending。
+/// 「可以注入了」的判据也相应调整 —— 不再是「等它开口」，
+/// 而是「已经开过口、且距最后一段输出已经静默满 quiet」，
+/// 因为首批输出很可能在探测回来之前就已经躺在缓冲里了。
+/// 整段等待以 timeout 为上限；通道提前结束或到点都返回「没就绪」，调用方据此不写任何字节。
+/// 读到的字节一律追加进 pending，绝不丢弃（motd 必须完整还给用户）。
+/// 返回（探测到的 shell 类型，是否真的静默到提示符）。
+async fn buffer_shell_while_probing<F>(
     channel: &mut SshChannel,
-    sink: &mut Vec<u8>,
-    timeout: Duration,
-    quiet: Duration,
-) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
-    let mut saw_data = false;
+    pending: &mut Vec<u8>,
+    probe: F,
+) -> (RemoteShell, bool)
+where
+    F: std::future::Future<Output = RemoteShell>,
+{
+    let mut probe = std::pin::pin!(probe);
+    let mut probed: Option<RemoteShell> = None;
+    let mut last_output: Option<std::time::Instant> = None;
+    let deadline = std::time::Instant::now() + SHELL_READY_TIMEOUT;
     loop {
         let now = std::time::Instant::now();
         if now >= deadline {
-            return saw_data;
+            return (probed.unwrap_or(RemoteShell::Unsupported), false);
         }
-        // 还没听到第一句时按剩余总时长等；已经听到过就只看静默
-        let slice = if saw_data {
-            std::cmp::min(quiet, deadline - now)
-        } else {
-            deadline - now
+        // 开过口 + 静默满 quiet + 探测有结果 -> shell 已经停在提示符上，可以注入了
+        if let (Some(last), Some(shell)) = (last_output, probed)
+            && now.duration_since(last) >= SHELL_READY_QUIET
+        {
+            return (shell, true);
+        }
+        // 这一轮最多等多久：说过话就只看静默，没说过话就一直等到整体超时
+        // （慢启动的 .bashrc 不能当成「不说话」）
+        let slice = match last_output {
+            Some(last) => std::cmp::min(
+                SHELL_READY_QUIET.saturating_sub(now.duration_since(last)),
+                deadline - now,
+            ),
+            None => deadline - now,
         };
-        match tokio::time::timeout(slice, channel.wait()).await {
-            Ok(Some(ChannelMsg::Data { data })) => {
-                sink.extend_from_slice(&data);
-                saw_data = true;
-            }
-            Ok(Some(ChannelMsg::ExtendedData { data, .. })) => {
-                sink.extend_from_slice(&data);
-                saw_data = true;
-            }
-            // 通道本身的其他消息（窗口调整、退出码…）不算「说话」，继续等
-            Ok(Some(_)) => continue,
-            // 静默到点或通道结束
-            Ok(None) | Err(_) => return saw_data,
+        let slice = slice.max(Duration::from_millis(1));
+        tokio::select! {
+            // 探测结果一到就记下来：它自带 1.5 秒上限，不会把这里拖住
+            shell = &mut probe, if probed.is_none() => probed = Some(shell),
+            msg = tokio::time::timeout(slice, channel.wait()) => match msg {
+                Ok(Some(ChannelMsg::Data { data })) => {
+                    pending.extend_from_slice(&data);
+                    last_output = Some(std::time::Instant::now());
+                }
+                Ok(Some(ChannelMsg::ExtendedData { data, .. })) => {
+                    pending.extend_from_slice(&data);
+                    last_output = Some(std::time::Instant::now());
+                }
+                // 通道自身的其他消息（窗口调整、退出码…）不是输出，继续等
+                Ok(Some(_)) => {}
+                // 通道结束 -> 不会再有输出了
+                Ok(None) => return (probed.unwrap_or(RemoteShell::Unsupported), false),
+                // 这段静默/剩余时长到点 -> 回到循环头判断
+                Err(_) => {}
+            },
         }
     }
 }
@@ -1076,6 +1140,8 @@ async fn write_line(channel: &mut SshChannel, line: &str) -> bool {
 /// 参数：handle 为已认证连接
 /// 核心流程：在独立的 exec 通道上跑一条只读的 printf（不碰交互式 shell），
 /// 超时或执行失败都按不支持处理 —— 探测本身不能成为连接失败的理由。
+/// 调用方必须**先**开好交互 shell 通道再调这里：这条 exec 通道是本连接的第二条
+/// session，PAM 的 motd 已经发给了第一条（交互 shell）并被缓冲下来。
 async fn detect_remote_shell(handle: &Arc<client::Handle<ClientHandler>>) -> RemoteShell {
     let probe = tokio::time::timeout(
         SHELL_PROBE_TIMEOUT,
@@ -1339,6 +1405,8 @@ mod tests {
         Fixed(&'static str),
         /// 往 stderr 写错误并以退出码 1 结束（模拟命令失败）。
         Fail,
+        /// 直接拒绝 exec 请求（模拟服务端禁用 exec），探测只能按失败处理。
+        Reject,
     }
 
     /// 测试用服务端：接受任意密码，把收到的数据原样回显，
@@ -1353,6 +1421,10 @@ mod tests {
         exec_mode: ExecMode,
         /// 是否像真行编辑器那样在回显之后补一句提示符。
         prompt: bool,
+        /// 是否只在「本连接的第一条 session」上吐 banner（模拟 PAM：motd 只发给首个 session）。
+        first_session_only: bool,
+        /// 各连接上 shell 通道收到的字节（只记录客户端写进来的）。
+        received: Arc<Mutex<Vec<u8>>>,
     }
 
     struct EchoHandler {
@@ -1363,6 +1435,14 @@ mod tests {
         exec_mode: ExecMode,
         /// 是否在回显之后补一句提示符（模拟真 shell 的「已就绪」信号）。
         prompt: bool,
+        /// 是否只在「本连接的第一条 session」上吐 banner。
+        first_session_only: bool,
+        /// 本连接上已经开过几条 session 通道（每开一条 +1）。
+        session_seq: u32,
+        /// 通道 -> 它是本连接的第几条 session（从 1 开始）。
+        session_ordinal: std::collections::HashMap<ChannelId, u32>,
+        /// shell 通道收到的字节 -> 用例据此断言客户端到底发了什么。
+        received: Arc<Mutex<Vec<u8>>>,
     }
 
     impl server::Handler for EchoHandler {
@@ -1386,10 +1466,13 @@ mod tests {
 
         async fn channel_open_session(
             &mut self,
-            _channel: Channel<Msg>,
+            channel: Channel<Msg>,
             reply: ChannelOpenHandle,
             _session: &mut Session,
         ) -> Result<(), Self::Error> {
+            // 记下这是本连接的第几条 session -> 用来模拟「motd 只发给第一个 session」
+            self.session_seq += 1;
+            self.session_ordinal.insert(channel.id(), self.session_seq);
             reply.accept().await;
             Ok(())
         }
@@ -1399,6 +1482,13 @@ mod tests {
             channel: ChannelId,
             session: &mut Session,
         ) -> Result<(), Self::Error> {
+            // 模拟 PAM：motd 只发给本连接的第一条 session，
+            // 抢占首 session 的那条通道（例如探测用的 exec）会把 motd 吃掉
+            if self.first_session_only
+                && self.session_ordinal.get(&channel).copied() != Some(1)
+            {
+                return Ok(());
+            }
             let _ = session.data(channel, format!("{}\r\n", self.banner).into_bytes());
             Ok(())
         }
@@ -1451,7 +1541,11 @@ mod tests {
             data: &[u8],
             session: &mut Session,
         ) -> Result<(), Self::Error> {
-            let _ = session.channel_success(channel);
+            let _ = match self.exec_mode {
+                // 拒绝这条 exec 请求 -> 客户端只能当「探测失败」处理
+                ExecMode::Reject => session.channel_failure(channel),
+                _ => session.channel_success(channel),
+            };
             match self.exec_mode {
                 ExecMode::Echo => {
                     let _ = session.data(channel, data.to_vec());
@@ -1463,6 +1557,7 @@ mod tests {
                     let _ = session.extended_data(channel, 1, b"REMOTE_METRICS_FAIL\n".to_vec());
                     let _ = session.exit_status_request(channel, 1);
                 }
+                ExecMode::Reject => {}
             }
             let _ = session.eof(channel);
             let _ = session.close(channel);
@@ -1495,6 +1590,10 @@ mod tests {
             {
                 return Ok(());
             }
+            // 先记账再回显 -> 用例可以断言「服务端到底收到过什么」
+            if let Ok(mut log) = self.received.lock() {
+                log.extend_from_slice(data);
+            }
             let _ = session.data(channel, data.to_vec());
             if self.prompt && data.ends_with(b"\r") {
                 // 真行编辑器执行完一行会重画提示符 -> 注入侧据此确认「命令真的执行了」
@@ -1513,6 +1612,10 @@ mod tests {
                 relayed: Arc::clone(&self.relayed),
                 exec_mode: self.exec_mode,
                 prompt: self.prompt,
+                first_session_only: self.first_session_only,
+                session_seq: 0,
+                session_ordinal: std::collections::HashMap::new(),
+                received: Arc::clone(&self.received),
             }
         }
     }
@@ -1549,12 +1652,26 @@ mod tests {
         spawn_server_with("WELCOME", ExecMode::Fail).await
     }
 
-    /// 起一个「像真 shell 一样」的服务端：回显输入后补一句提示符。
+    /// 起一个可配置 exec 行为、带提示符且记账的服务端（banner 用默认值）。
     ///
     /// 参数：reply 为 exec（shell 探测）时写回的固定文本
-    /// 核心流程：用来验证注入全流程 —— 注入侧要拿到「提示符」当证据才会写钩子。
+    /// 核心流程：等价于带 motd 的版本，只是 motd 用默认的 WELCOME。
+    #[allow(dead_code)]
     async fn spawn_prompt_shell_server(reply: &'static str) -> u16 {
-        spawn_full_server("WELCOME", ExecMode::Fixed(reply), true).await
+        spawn_full_server("WELCOME", ExecMode::Fixed(reply), true).await.0
+    }
+
+    /// 起一个带自定义 motd 的 prompt 型服务端，并把「服务端收到的字节」交回来。
+    ///
+    /// 参数：banner 为登录后先吐的整段 motd（可含 ANSI 颜色），
+    /// reply 为 exec（shell 探测）时写回的固定文本
+    /// 核心流程：注入窗口内客户端不会把回显交给前端，所以只能从服务端侧
+    /// 反推「客户端到底写了什么」；这也是「钩子真的发出去了」的唯一可观测证据。
+    async fn spawn_recording_motd_server(
+        banner: &'static str,
+        reply: &'static str,
+    ) -> (u16, Arc<Mutex<Vec<u8>>>) {
+        spawn_full_server(banner, ExecMode::Fixed(reply), true).await
     }
 
     /// 起一个可配置 exec 行为的本地 SSH 服务端。
@@ -1562,15 +1679,47 @@ mod tests {
     /// 参数：banner 为 shell 建立后先吐的标记文字，exec_mode 为 exec 应答方式
     /// 核心流程：默认不打提示符，保持既有用例行为不变。
     async fn spawn_server_with(banner: &'static str, exec_mode: ExecMode) -> u16 {
-        spawn_full_server(banner, exec_mode, false).await
+        spawn_full_server(banner, exec_mode, false).await.0
     }
 
     /// 起一个可配置 exec 行为与提示符行为的本地 SSH 服务端。
     ///
     /// 参数：banner 为 shell 建立后先吐的标记文字，exec_mode 为 exec 应答方式，
     /// prompt 为是否在回显后补提示符
-    /// 核心流程：绑 127.0.0.1:0 拿随机端口 → 后台跑 russh server → 返回端口。
-    async fn spawn_full_server(banner: &'static str, exec_mode: ExecMode, prompt: bool) -> u16 {
+    /// 核心流程：等价于「motd 发给每条 session」的版本，保持既有用例行为不变。
+    async fn spawn_full_server(
+        banner: &'static str,
+        exec_mode: ExecMode,
+        prompt: bool,
+    ) -> (u16, Arc<Mutex<Vec<u8>>>) {
+        spawn_full_server_with(banner, exec_mode, prompt, false).await
+    }
+
+    /// 起一台「motd 只发给本连接第一个 session」的服务端（模拟 PAM 的真实行为）。
+    ///
+    /// 参数：motd 为登录后首个 session 上吐出的整段 motd，exec_mode 为 exec 应答方式
+    /// 核心流程：谁先开 session 通道，motd 就归谁 —— 探测用的 exec 通道若抢先，
+    /// 交互 shell 就再也拿不到 motd，正是线上「连接后 motd 丢失」的复现条件。
+    async fn spawn_first_session_motd_server(
+        motd: &'static str,
+        exec_mode: ExecMode,
+    ) -> (u16, Arc<Mutex<Vec<u8>>>) {
+        spawn_full_server_with(motd, exec_mode, true, true).await
+    }
+
+    /// 起一个可配置 exec 行为与提示符行为的本地 SSH 服务端。
+    ///
+    /// 参数：banner 为 shell 建立后先吐的标记文字，exec_mode 为 exec 应答方式，
+    /// prompt 为是否在回显后补提示符，
+    /// first_session_only 为「banner 是否只发给本连接的第一条 session」
+    /// 核心流程：绑 127.0.0.1:0 拿随机端口 → 后台跑 russh server →
+    /// 返回端口与服务端收到的字节（用于反推客户端到底写了什么）。
+    async fn spawn_full_server_with(
+        banner: &'static str,
+        exec_mode: ExecMode,
+        prompt: bool,
+        first_session_only: bool,
+    ) -> (u16, Arc<Mutex<Vec<u8>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("应能绑定端口");
         let port = listener.local_addr().expect("应能取到本地地址").port();
 
@@ -1585,17 +1734,21 @@ mod tests {
             ..Default::default()
         });
 
+        let received: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let received_for_server = Arc::clone(&received);
         tokio::spawn(async move {
             let mut server = EchoServer {
                 banner,
                 relayed: Arc::new(Mutex::new(HashSet::new())),
                 exec_mode,
                 prompt,
+                first_session_only,
+                received: received_for_server,
             };
             let _ = server.run_on_socket(config, &listener).await;
         });
 
-        port
+        (port, received)
     }
 
     #[test]
@@ -1871,6 +2024,58 @@ mod tests {
         collected
     }
 
+    /// open_shell 交付的首批字节（pending）加上通道上后续到达的字节。
+    ///
+    /// 参数：pending 为 open_shell 返回的首批输出，channel 为同一条通道，needle 为目标片段
+    /// 核心流程：motd 这类首批输出现在由 pending 交付（探测期间缓冲、一个字节都没丢），
+    /// 所以要断言「shell 到底说了什么」必须两处一起看；pending 里已命中就不再等通道。
+    fn pending_then_channel(pending: &[u8], channel: &mut SshChannel, needle: &str) -> String {
+        let mut text = String::from_utf8_lossy(pending).to_string();
+        if text.contains(needle) {
+            return text;
+        }
+        text.push_str(&read_channel_until(channel, needle));
+        text
+    }
+
+    /// 在一个固定时间窗内收通道上的数据。
+    ///
+    /// 参数：channel 为待读通道，window 为观察时长
+    /// 核心流程：用于断言「这段时间里通道上到底有没有东西」——
+    /// 注入窗口把回显吞掉之后，这类「应该什么都没有」的断言只能靠固定时间窗来证。
+    fn read_channel_for(channel: &mut SshChannel, window: Duration) -> String {
+        let mut collected = String::new();
+        let deadline = std::time::Instant::now() + window;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match runtime().block_on(async { tokio::time::timeout(remaining, channel.wait()).await }) {
+                Ok(Some(ChannelMsg::Data { data })) => {
+                    collected.push_str(&String::from_utf8_lossy(&data));
+                }
+                Ok(Some(ChannelMsg::ExtendedData { data, .. })) => {
+                    collected.push_str(&String::from_utf8_lossy(&data));
+                }
+                Ok(Some(ChannelMsg::Eof)) | Ok(Some(ChannelMsg::Close)) | Ok(None) => break,
+                Ok(Some(_)) => {}
+                Err(_) => break,
+            }
+        }
+        collected
+    }
+
+    /// 取服务端收到的字节（用例据此反推客户端写了什么）。
+    ///
+    /// 参数：log 为服务端记账句柄
+    /// 核心流程：注入窗口内的回显不会到前端，只能从服务端侧确认「字节确实发出去了」。
+    fn recorded(log: &Arc<Mutex<Vec<u8>>>) -> String {
+        log.lock()
+            .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+            .unwrap_or_default()
+    }
+
     #[test]
     fn opens_shell_and_subsystem_on_same_connection() {
         let store = runtime().block_on(async { Store::open_in_memory().await }).expect("内存库");
@@ -1886,7 +2091,7 @@ mod tests {
         let mut shell = opened.channel;
         let shell_id = shell.id();
         assert!(
-            read_channel_until(&mut shell, "WELCOME").contains("WELCOME"),
+            pending_then_channel(&opened.pending, &mut shell, "WELCOME").contains("WELCOME"),
             "shell 通道应收到问候"
         );
 
@@ -1999,7 +2204,7 @@ mod tests {
             "不支持的 shell 应返回 None（调用方一个字节都不发）"
         );
         assert!(
-            cwd_hook_payload(RemoteShell::Unsupported, 80).is_none(),
+            cwd_hook_payload(RemoteShell::Unsupported).is_none(),
             "不支持的 shell 不该拼出任何要发送的内容"
         );
 
@@ -2019,27 +2224,26 @@ mod tests {
         assert_eq!(RemoteShell::classify(""), RemoteShell::Unsupported);
     }
 
-    /// 注入整行的顺序：先装钩子，再恢复回显，最后才擦行。
+    /// 注入整行的顺序：先装钩子，再恢复回显；不含任何擦行语句。
     #[test]
     fn osc7_payload_restores_echo_before_erasing() {
-        let payload = cwd_hook_payload(RemoteShell::Bash, 80).expect("bash 应拼出注入内容");
+        let payload = cwd_hook_payload(RemoteShell::Bash).expect("bash 应拼出注入内容");
 
         let install_at = payload.find("__rmx_osc7").expect("应包含钩子");
         let restore_at = payload.find(ECHO_RESTORE).expect("应包含恢复回显的语句");
-        let clear_at = payload.find(r"\033[1A\033[2K").expect("应包含擦行语句");
 
         assert!(
             install_at < restore_at,
             "应先装钩子再恢复回显，实际：{payload}"
         );
+        // 回显靠「注入窗口里丢字节」消除，payload 里不能再有任何擦行/上移动作
         assert!(
-            restore_at < clear_at,
-            "回显必须在本行内恢复，且恢复后再擦掉自己那行，实际：{payload}"
+            !payload.contains(r"\033[1A") && !payload.contains(r"\033[2K"),
+            "payload 不该再擦行（擦多了会连 motd 一起吃掉），实际：{payload}"
         );
-        // 关回显那一步是单独的短命令，擦行要能把它连折行一起擦掉
         assert!(
-            payload.matches(r"\033[1A\033[2K").count() >= 2,
-            "擦行语句至少要能擦掉关回显那行与其下两行，实际：{payload}"
+            !payload.contains(r"printf '\r"),
+            "payload 不该再用 printf 输出擦行序列，实际：{payload}"
         );
         assert!(!payload.contains('\r'), "整行里不能有回车字节：{payload}");
     }
@@ -2047,44 +2251,64 @@ mod tests {
     /// 关回显之后，只有「自己那行的回显」不算 shell 已经执行完成的证据。
     #[test]
     fn osc7_prompt_evidence_ignores_own_echo() {
+        let echo = ECHO_OFF_LINE.as_bytes();
         // 只有自己那行的回显（行编辑器收到什么回什么）-> 还不能注入
-        assert!(!has_prompt_after_echo(ECHO_OFF_LINE.as_bytes()));
-        assert!(!has_prompt_after_echo(
-            format!("{}\r\n", ECHO_OFF_LINE).as_bytes()
+        assert!(!has_prompt_after_own_echo(echo, echo));
+        assert!(!has_prompt_after_own_echo(
+            format!("{}\r\n", ECHO_OFF_LINE).as_bytes(),
+            echo
         ));
-        // 回显之外还有提示符 -> 说明 stty 真的执行完了
-        assert!(has_prompt_after_echo(
-            format!("{}\r\nhuya@host:~$ ", ECHO_OFF_LINE).as_bytes()
+        // 回显分片到达（尾巴只是回显的开头）也不能当成提示符证据
+        assert!(!has_prompt_after_own_echo(b"stty -echo 2>/dev/nu", echo));
+        assert!(!has_prompt_after_own_echo(b"stty", echo));
+        // 回显之外还有提示符 -> 说明这条命令真的执行完了
+        assert!(has_prompt_after_own_echo(
+            format!("{}\r\nhuya@host:~$ ", ECHO_OFF_LINE).as_bytes(),
+            echo
         ));
-        assert!(has_prompt_after_echo(b"\r\nP> "));
-        assert!(!has_prompt_after_echo(b""));
+        assert!(has_prompt_after_own_echo(b"\r\nP> ", echo));
+        assert!(!has_prompt_after_own_echo(b"", echo));
+        // 注入行自己的回显同理（第二段窗口用的就是这一条）
+        let payload = cwd_hook_payload(RemoteShell::Bash).expect("bash 应拼出注入内容");
+        assert!(!has_prompt_after_own_echo(
+            payload.as_bytes(),
+            payload.as_bytes()
+        ));
+        assert!(has_prompt_after_own_echo(
+            format!("{payload}\r\nPS> ").as_bytes(),
+            payload.as_bytes()
+        ));
     }
 
-    /// 终端越窄，注入行折行越多，要擦掉的行数也应跟着变多。
+    /// 擦行逻辑已删除：payload 里不许出现任何清行/上移的 ANSI 序列。
     #[test]
     fn osc7_clear_sequence_grows_on_narrow_terminals() {
-        let narrow = osc7_clear_sequence(40, 2);
-        let wide = osc7_clear_sequence(200, 2);
-        assert!(
-            narrow.matches(r"\033[1A\033[2K").count() > wide.matches(r"\033[1A\033[2K").count(),
-            "窄终端应擦更多行：narrow={narrow} wide={wide}"
-        );
-        assert!(narrow.starts_with(r"printf '\r\033[2K"), "应以清行开头：{narrow}");
-        assert!(narrow.ends_with(r"\r'"), "应回到行首收尾：{narrow}");
-        // 行数只跟列宽与额外占用有关 -> 同样的额外行数下宽终端最省
-        assert!(
-            wide.matches(r"\033[1A\033[2K").count() >= 2,
-            "宽终端也要擦掉关回显那行与注入行：{wide}"
-        );
+        // 用例名沿用历史（原先是验证「窄终端多擦几行」），现在验证「根本不再擦」：
+        // 屏幕上的注入痕迹由注入窗口丢字节消除，与终端宽度无关
+        for shell in [RemoteShell::Bash, RemoteShell::Zsh] {
+            let payload = cwd_hook_payload(shell).expect("支持的 shell 应拼出注入内容");
+            for banned in [r"\033[1A", r"\033[2K", r"\033[K", r"\033[2J", r"\r"] {
+                assert!(
+                    !payload.contains(banned),
+                    "payload 不该包含擦行/上移序列 {banned}，实际：{payload}"
+                );
+            }
+            assert!(
+                !payload.contains('\u{1b}'),
+                "payload 里不能出现裸 ESC 字节（只允许 printf 的 \\033 字面量），实际：{payload}"
+            );
+        }
     }
 
-    /// 探测到 bash 时，注入三步要按「关回显 → 写钩子 → 恢复回显并擦行」发出去。
+    /// 探测到 bash 时，注入要按「关回显 → 写钩子 → 恢复回显」发出去，
+    /// 而且这些字节一个都不许进前端。
     #[test]
     fn injects_osc7_hook_into_shell_channel() {
         let store = runtime().block_on(async { Store::open_in_memory().await }).expect("内存库");
         // exec 返回 "bash" -> 探测认定 bash -> open_shell 应发注入语句；
         // 这台服务端会像真行编辑器那样在回显后补提示符，注入才会走到第三步
-        let port = runtime().block_on(spawn_prompt_shell_server("/bin/bash\nbash\n"));
+        let (port, received) =
+            runtime().block_on(spawn_recording_motd_server("WELCOME", "/bin/bash\nbash\n"));
 
         let connection = SshConnection::connect(&store, &echo_options(port, true))
             .expect("应能连上测试服务端");
@@ -2093,36 +2317,114 @@ mod tests {
             .expect("应能在连接上开 shell 通道");
         let mut shell = opened.channel;
 
-        assert!(
-            String::from_utf8_lossy(&opened.pending).contains("WELCOME"),
-            "注入前读到的登录 banner 必须原样交回上层，实际：{:?}",
-            String::from_utf8_lossy(&opened.pending)
-        );
-        // 关回显那一步在写钩子之前发出，它的回显也在这批待交付字节里
         let pending = String::from_utf8_lossy(&opened.pending).to_string();
         assert!(
-            pending.contains(ECHO_OFF_LINE),
-            "写钩子之前应先关掉远端回显，实际：{pending:?}"
+            pending.contains("WELCOME"),
+            "注入前读到的登录 banner 必须原样交回上层，实际：{pending:?}"
+        );
+        // 注入从「关回显」那一行开始 -> 它的回显落在窗口里被丢弃，不该上屏
+        assert!(
+            !pending.contains(ECHO_OFF_LINE),
+            "注入窗口内的回显不能进前端（否则就是屏幕上那行注入命令），实际：{pending:?}"
+        );
+        assert!(
+            !pending.contains("__rmx_osc7"),
+            "钩子本身绝不能上屏，实际：{pending:?}"
         );
 
-        // 测试服务端会把写进来的字节回显 -> 收回来的就是注入内容
-        let seen = read_channel_until(&mut shell, "__rmx_osc7");
+        // 前端看不到 -> 只能从服务端侧确认「这些字节确实发出去了」
+        let sent = recorded(&received);
         assert!(
-            seen.contains("__rmx_osc7"),
-            "应把钩子函数写进 shell 通道，实际：{seen:?}"
+            sent.contains(ECHO_OFF_LINE),
+            "写钩子之前应先关掉远端回显，实际：{sent:?}"
         );
         assert!(
-            seen.contains("PROMPT_COMMAND"),
-            "注入内容应包含 PROMPT_COMMAND 钩子，实际：{seen:?}"
-        );
-        // 关回显已经先发过 -> 这里只该看到钩子本体，说明注入确实在回显关闭之后
-        assert!(
-            !seen.contains(ECHO_OFF_LINE),
-            "注入语句必须发生在关回显之后，实际：{seen:?}"
+            sent.contains("__rmx_osc7") && sent.contains("PROMPT_COMMAND"),
+            "应把钩子函数与 PROMPT_COMMAND 钩子写进 shell 通道，实际：{sent:?}"
         );
         assert!(
-            seen.contains(ECHO_RESTORE),
-            "注入后必须把回显恢复回来，实际：{seen:?}"
+            sent.contains(ECHO_RESTORE),
+            "注入后必须把回显恢复回来，实际：{sent:?}"
+        );
+        assert!(
+            !sent.contains(r"\033[1A") && !sent.contains(r"\033[2K"),
+            "注入内容不该带任何擦行序列，实际：{sent:?}"
+        );
+
+        // 两段窗口把注入的回显全吃掉了 -> 通道上不该再有残留字节留给前端
+        let leaked = read_channel_for(&mut shell, Duration::from_millis(300));
+        assert!(
+            leaked.is_empty(),
+            "注入窗口内的字节必须被后端吞掉，实际漏出：{leaked:?}"
+        );
+
+        runtime().block_on(connection.disconnect()).expect("断开应成功");
+    }
+
+    /// 注入窗口内的回显被丢弃：服务器把注入行原样回显，但这些字节不进 pending。
+    #[test]
+    fn osc7_injection_window_swallows_own_echo() {
+        let store = runtime().block_on(async { Store::open_in_memory().await }).expect("内存库");
+        let (port, received) =
+            runtime().block_on(spawn_recording_motd_server("WELCOME", "/bin/zsh\nzsh\n"));
+
+        let connection = SshConnection::connect(&store, &echo_options(port, true))
+            .expect("应能连上测试服务端");
+        let opened = runtime()
+            .block_on(connection.open_shell("xterm-256color", 80, 24))
+            .expect("应能在连接上开 shell 通道");
+        let mut shell = opened.channel;
+
+        // 服务端确实把注入行回显回来了（这是真机上「屏幕上出现注入命令」的来源）
+        let sent = recorded(&received);
+        assert!(sent.contains("precmd_functions"), "zsh 钩子应已发出：{sent:?}");
+
+        // 但回显字节一个都没交回前端
+        let pending = String::from_utf8_lossy(&opened.pending).to_string();
+        for banned in [ECHO_OFF_LINE, "precmd_functions", "PS>"] {
+            assert!(
+                !pending.contains(banned),
+                "窗口内的字节不该进前端：{banned} 出现在 {pending:?}"
+            );
+        }
+        let leaked = read_channel_for(&mut shell, Duration::from_millis(300));
+        assert!(leaked.is_empty(), "窗口结束后也不该补发回显，实际：{leaked:?}");
+
+        runtime().block_on(connection.disconnect()).expect("断开应成功");
+    }
+
+    /// 注入窗口开启前的字节（motd 全文，含颜色序列）必须原样转发，一个都不许吞。
+    #[test]
+    fn osc7_motd_before_window_is_forwarded() {
+        /// 模拟真机 motd：多行 + 一行带颜色的链接。
+        const MOTD: &str = "Last login: Thu Nov  5 11:04:39 2026 from 172.25.102.136\r\nWelcome to Ubuntu 22.04 LTS\r\n\x1b[1;34mhttps://help.ubuntu.com/\x1b[0m";
+
+        let store = runtime().block_on(async { Store::open_in_memory().await }).expect("内存库");
+        let (port, _received) =
+            runtime().block_on(spawn_recording_motd_server(MOTD, "/bin/bash\nbash\n"));
+
+        let connection = SshConnection::connect(&store, &echo_options(port, true))
+            .expect("应能连上测试服务端");
+        let opened = runtime()
+            .block_on(connection.open_shell("xterm-256color", 80, 24))
+            .expect("应能在连接上开 shell 通道");
+
+        let pending = String::from_utf8_lossy(&opened.pending).to_string();
+        assert!(
+            pending.contains("Last login: Thu Nov  5 11:04:39 2026"),
+            "motd 第一行必须完整，实际：{pending:?}"
+        );
+        assert!(
+            pending.contains("Welcome to Ubuntu 22.04 LTS"),
+            "motd 第二行不能被擦掉，实际：{pending:?}"
+        );
+        assert!(
+            pending.contains("\x1b[1;34mhttps://help.ubuntu.com/\x1b[0m"),
+            "motd 里的颜色序列必须原样保留，实际：{pending:?}"
+        );
+        assert!(
+            !pending.contains(r"\033[1A") && !pending.contains(r"\033[2K"),
+            "前端不该收到任何擦行序列，实际：{pending:?}"
         );
 
         runtime().block_on(connection.disconnect()).expect("断开应成功");
@@ -2132,8 +2434,9 @@ mod tests {
     #[test]
     fn injection_aborts_without_prompt_evidence() {
         let store = runtime().block_on(async { Store::open_in_memory().await }).expect("内存库");
-        // 这台服务端只回显、从不打提示符 -> 注入侧拿不到证据
-        let port = runtime().block_on(spawn_exec_server("/bin/bash\nbash\n"));
+        // 这台服务端只回显、从不打提示符 -> 注入侧拿不到证据，窗口按超时收手
+        let (port, received) =
+            runtime().block_on(spawn_full_server("WELCOME", ExecMode::Fixed("/bin/bash\nbash\n"), false));
 
         let connection = SshConnection::connect(&store, &echo_options(port, true))
             .expect("应能连上测试服务端");
@@ -2142,6 +2445,7 @@ mod tests {
             .expect("应能在连接上开 shell 通道");
         let mut shell = opened.channel;
 
+        // 窗口内读到的内容一律不进前端；窗口结束后恢复转发 -> 兜底的 stty echo 回显可见
         let seen = read_channel_until(&mut shell, ECHO_RESTORE);
         assert!(
             !seen.contains("__rmx_osc7"),
@@ -2151,15 +2455,27 @@ mod tests {
             seen.contains(ECHO_RESTORE),
             "必须把回显恢复回来，绝不把用户留在看不见自己打字的状态，实际：{seen:?}"
         );
+        let pending = String::from_utf8_lossy(&opened.pending).to_string();
+        assert!(
+            pending.contains("WELCOME") && !pending.contains(ECHO_OFF_LINE),
+            "窗口外的 banner 要转发、窗口内的回显要吞掉，实际：{pending:?}"
+        );
+        // 服务端侧确认降级时确实只发了 stty echo，钩子一个字节都没发
+        let sent = recorded(&received);
+        assert!(
+            sent.contains(ECHO_RESTORE) && !sent.contains("__rmx_osc7"),
+            "降级路径只该恢复回显，实际：{sent:?}"
+        );
 
         runtime().block_on(connection.disconnect()).expect("断开应成功");
     }
 
-    /// 探测不到 bash/zsh 时，开 shell 后一个字节都不写。
+    /// 窗口超时后必须恢复正常转发，不能永久吞输出。
     #[test]
-    fn unsupported_shell_writes_nothing() {
+    fn osc7_window_timeout_resumes_forwarding() {
         let store = runtime().block_on(async { Store::open_in_memory().await }).expect("内存库");
-        let port = runtime().block_on(spawn_prompt_shell_server("/bin/sh\nsh\n"));
+        // 从不出提示符的服务端 -> 两段窗口都会走到超时兜底
+        let port = runtime().block_on(spawn_server_with("WELCOME", ExecMode::Fixed("/bin/bash\nbash\n")));
 
         let connection = SshConnection::connect(&store, &echo_options(port, true))
             .expect("应能连上测试服务端");
@@ -2168,17 +2484,191 @@ mod tests {
             .expect("应能在连接上开 shell 通道");
         let mut shell = opened.channel;
 
-        // 服务端会把收到的每个字节回显 -> 没回显就说明客户端确实没写
-        let seen = read_channel_until(&mut shell, "WELCOME");
+        // 用户自己的输入必须照常回显 -> 说明吞字节窗口已经关掉
+        runtime()
+            .block_on(async { shell.data(&b"PING_AFTER_WINDOW\r"[..]).await })
+            .expect("窗口结束后应仍可写");
+        let seen = read_channel_until(&mut shell, "PING_AFTER_WINDOW");
         assert!(
-            seen.contains("WELCOME"),
-            "应照常拿到登录 banner，实际：{seen:?}"
+            seen.contains("PING_AFTER_WINDOW"),
+            "窗口超时后必须恢复转发，实际：{seen:?}"
         );
         assert!(
-            !seen.contains(ECHO_OFF_LINE) && !seen.contains("__rmx_osc7"),
-            "不支持的 shell 不该收到任何注入字节，实际：{seen:?}"
+            !String::from_utf8_lossy(&opened.pending).contains(ECHO_OFF_LINE),
+            "窗口内的注入回显依旧不该进前端"
         );
-        assert!(opened.pending.is_empty(), "没注入时也不该吞掉任何输出");
+
+        runtime().block_on(connection.disconnect()).expect("断开应成功");
+    }
+
+    /// 探测不到 bash/zsh 时，开 shell 后一个字节都不写。
+    #[test]
+    fn unsupported_shell_writes_nothing() {
+        let store = runtime().block_on(async { Store::open_in_memory().await }).expect("内存库");
+        let (port, received) =
+            runtime().block_on(spawn_recording_motd_server("WELCOME", "/bin/sh\nsh\n"));
+
+        let connection = SshConnection::connect(&store, &echo_options(port, true))
+            .expect("应能连上测试服务端");
+        let opened = runtime()
+            .block_on(connection.open_shell("xterm-256color", 80, 24))
+            .expect("应能在连接上开 shell 通道");
+        let mut shell = opened.channel;
+
+        // banner 现在经 pending 交付（探测期间缓冲，一个字节都没吞）
+        let pending = String::from_utf8_lossy(&opened.pending).to_string();
+        assert!(
+            pending.contains("WELCOME"),
+            "应照常拿到登录 banner，实际：{pending:?}"
+        );
+        assert!(
+            !pending.contains(ECHO_OFF_LINE) && !pending.contains("__rmx_osc7"),
+            "不支持的 shell 不该收到任何注入字节，实际：{pending:?}"
+        );
+        // 一个字节都没写 -> 通道上也不该再有残留
+        let leaked = read_channel_for(&mut shell, Duration::from_millis(200));
+        assert!(leaked.is_empty(), "不支持的 shell 不该有任何回显，实际：{leaked:?}");
+        // 服务端侧的账本更硬：一个字节都没收到（连 stty 都没碰）
+        assert!(
+            recorded(&received).is_empty(),
+            "不支持的 shell 一个字节都不该发，实际：{:?}",
+            recorded(&received)
+        );
+
+        runtime().block_on(connection.disconnect()).expect("断开应成功");
+    }
+
+    /// 模拟 Ubuntu 真机 motd（`/run/motd.dynamic`）：多行、含空行与对齐的列。
+    const UBUNTU_MOTD: &str = concat!(
+        "Welcome to Ubuntu 22.04.5 LTS (GNU/Linux 5.15.0-119-generic x86_64)\r\n",
+        "\r\n",
+        " * Documentation:  https://help.ubuntu.com\r\n",
+        " * Management:     https://landscape.canonical.com\r\n",
+        " * Support:        https://ubuntu.com/pro\r\n",
+        "\r\n",
+        "  System information as of Thu Nov  5 11:04:39 UTC 2026\r\n",
+        "\r\n",
+        "  System load:  0.08               Processes:             231\r\n",
+        "  Usage of /:   41.3% of 97.87GB   Users logged in:       1\r\n",
+        "\r\n",
+        "42 updates can be applied immediately.\r\n",
+    );
+
+    /// motd 归首个 session：交互 shell 先开通道，exec 探测后开 ->
+    /// pending 里必须能拿到 motd 全文（不只是「Last login + 提示符」）。
+    #[test]
+    fn open_shell_delivers_full_motd_from_first_session() {
+        let store = runtime().block_on(async { Store::open_in_memory().await }).expect("内存库");
+        // 这台服务端把 motd 只发给本连接的第一个 session（与 PAM 行为一致）：
+        // 探测用的 exec 通道一旦抢占首 session，motd 就彻底丢了
+        let (port, received) = runtime().block_on(spawn_first_session_motd_server(
+            UBUNTU_MOTD,
+            ExecMode::Fixed("/bin/bash\nbash\n"),
+        ));
+
+        let connection = SshConnection::connect(&store, &echo_options(port, true))
+            .expect("应能连上测试服务端");
+        let opened = runtime()
+            .block_on(connection.open_shell("xterm-256color", 80, 24))
+            .expect("应能在连接上开 shell 通道");
+
+        let pending = String::from_utf8_lossy(&opened.pending).to_string();
+        // 逐行比对：出问题时能直接看出丢的是哪一行，而不是只知道「少了点什么」
+        for line in UBUNTU_MOTD.lines().filter(|line| !line.trim().is_empty()) {
+            assert!(
+                pending.contains(line),
+                "motd 丢了这一行：{line:?}，实际：{pending:?}"
+            );
+        }
+        // 顺序也要对：motd 必须从第一行开始原样出现
+        assert!(
+            pending.starts_with(UBUNTU_MOTD),
+            "motd 必须完整地从第一行开始出现，实际：{pending:?}"
+        );
+        // 探测成功且是 bash -> 钩子照常装，但注入痕迹一个字节都不能进 pending
+        let sent = recorded(&received);
+        assert!(
+            sent.contains("__rmx_osc7") && sent.contains("PROMPT_COMMAND"),
+            "探测到 bash 时应照常注入钩子，实际：{sent:?}"
+        );
+        assert!(
+            !pending.contains("__rmx_osc7") && !pending.contains(ECHO_OFF_LINE),
+            "注入痕迹不能混进 pending，实际：{pending:?}"
+        );
+
+        runtime().block_on(connection.disconnect()).expect("断开应成功");
+    }
+
+    /// 探测失败（服务端拒 exec）时 motd 仍完整、shell 仍可用、一个字节都不注入。
+    #[test]
+    fn open_shell_keeps_motd_when_probe_rejected() {
+        let store = runtime().block_on(async { Store::open_in_memory().await }).expect("内存库");
+        let (port, received) = runtime().block_on(spawn_first_session_motd_server(
+            UBUNTU_MOTD,
+            ExecMode::Reject,
+        ));
+
+        let connection = SshConnection::connect(&store, &echo_options(port, true))
+            .expect("应能连上测试服务端");
+        let opened = runtime()
+            .block_on(connection.open_shell("xterm-256color", 80, 24))
+            .expect("探测失败也不该让开 shell 失败");
+        let mut shell = opened.channel;
+
+        let pending = String::from_utf8_lossy(&opened.pending).to_string();
+        assert!(
+            pending.starts_with(UBUNTU_MOTD),
+            "探测失败时 motd 更要完整，实际：{pending:?}"
+        );
+        // 探测拿不到结果 -> 当不支持处理 -> 一个字节都不写（先断言账本，再写用户输入）
+        assert!(
+            recorded(&received).is_empty(),
+            "探测失败时不该写任何注入字节，实际：{:?}",
+            recorded(&received)
+        );
+
+        // shell 本体照常可用：写进去的字节会被回显
+        runtime()
+            .block_on(async { shell.data(&b"PING_AFTER_PROBE\r"[..]).await })
+            .expect("探测失败后 shell 仍应可写");
+        let seen = read_channel_until(&mut shell, "PING_AFTER_PROBE");
+        assert!(
+            seen.contains("PING_AFTER_PROBE"),
+            "探测失败后 shell 必须照常转发，实际：{seen:?}"
+        );
+
+        runtime().block_on(connection.disconnect()).expect("断开应成功");
+    }
+
+    /// 探测成功但 shell 不支持（fish）：motd 完整、一个字节都不注入。
+    #[test]
+    fn open_shell_keeps_motd_for_unsupported_shell() {
+        let store = runtime().block_on(async { Store::open_in_memory().await }).expect("内存库");
+        let (port, received) = runtime().block_on(spawn_first_session_motd_server(
+            UBUNTU_MOTD,
+            ExecMode::Fixed("/usr/bin/fish\nfish\n"),
+        ));
+
+        let connection = SshConnection::connect(&store, &echo_options(port, true))
+            .expect("应能连上测试服务端");
+        let opened = runtime()
+            .block_on(connection.open_shell("xterm-256color", 80, 24))
+            .expect("应能在连接上开 shell 通道");
+
+        let pending = String::from_utf8_lossy(&opened.pending).to_string();
+        assert!(
+            pending.starts_with(UBUNTU_MOTD),
+            "fish 上 motd 同样要完整，实际：{pending:?}"
+        );
+        assert!(
+            !pending.contains(ECHO_OFF_LINE) && !pending.contains("__rmx_osc7"),
+            "fish 不该收到任何注入字节，实际：{pending:?}"
+        );
+        assert!(
+            recorded(&received).is_empty(),
+            "fish 一个字节都不该发，实际：{:?}",
+            recorded(&received)
+        );
 
         runtime().block_on(connection.disconnect()).expect("断开应成功");
     }
@@ -2290,12 +2780,12 @@ mod tests {
             &jump_options(target_port, jumper_port, true, true),
         )
         .expect("应能经跳板连到目标");
-        let mut shell = runtime()
+        let opened = runtime()
             .block_on(connection.open_shell("xterm-256color", 80, 24))
-            .expect("应在目标机上开出 shell")
-            .channel;
+            .expect("应在目标机上开出 shell");
+        let mut shell = opened.channel;
 
-        let seen = read_channel_until(&mut shell, "TARGET");
+        let seen = pending_then_channel(&opened.pending, &mut shell, "TARGET");
         assert!(seen.contains("TARGET"), "shell 应来自目标机，实际：{seen:?}");
         assert!(!seen.contains("JUMPER"), "不应停在跳板机上，实际：{seen:?}");
 
@@ -2333,12 +2823,12 @@ mod tests {
 
         // 目标连接内部持有跳板 -> 丢掉本地跳板句柄后目标仍应可用
         drop(jumper);
-        let mut shell = runtime()
+        let opened = runtime()
             .block_on(target.open_shell("xterm-256color", 80, 24))
-            .expect("跳板句柄释放后目标连接仍应可用")
-            .channel;
+            .expect("跳板句柄释放后目标连接仍应可用");
+        let mut shell = opened.channel;
         assert!(
-            read_channel_until(&mut shell, "TARGET").contains("TARGET"),
+            pending_then_channel(&opened.pending, &mut shell, "TARGET").contains("TARGET"),
             "shell 应来自目标机"
         );
 

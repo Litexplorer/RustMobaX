@@ -88,6 +88,7 @@ CREATE TABLE IF NOT EXISTS tunnel_config (
     listen_port INTEGER NOT NULL DEFAULT 0,
     target_host TEXT NOT NULL DEFAULT '',
     target_port INTEGER NOT NULL DEFAULT 0,
+    auto_start  INTEGER NOT NULL DEFAULT 0,
     created_at  INTEGER NOT NULL,
     updated_at  INTEGER NOT NULL
 )";
@@ -95,8 +96,12 @@ CREATE TABLE IF NOT EXISTS tunnel_config (
 const DDL_TUNNEL_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_tunnel_config_session_id ON tunnel_config(session_id)";
 
+/// 给旧库补列：tunnel_config 早先没有 auto_start。
+const DDL_TUNNEL_ADD_AUTO_START: &str =
+    "ALTER TABLE tunnel_config ADD COLUMN auto_start INTEGER NOT NULL DEFAULT 0";
+
 const TUNNEL_COLUMNS: &str = "id, name, session_id, kind, listen_host, listen_port, \
-     target_host, target_port, created_at, updated_at";
+     target_host, target_port, auto_start, created_at, updated_at";
 
 const SESSION_COLUMNS: &str = "s.id, s.group_id, s.name, s.protocol, s.host, s.port, \
      s.username, s.auth_kind, s.extra, s.created_at, s.updated_at";
@@ -185,6 +190,8 @@ struct TunnelConfigRow {
     listen_port: i64,
     target_host: String,
     target_port: i64,
+    /// 库里存 INTEGER，0 表示关闭。
+    auto_start: i64,
     created_at: i64,
     updated_at: i64,
 }
@@ -210,6 +217,7 @@ impl TryFrom<TunnelConfigRow> for TunnelConfig {
             listen_port,
             target_host: row.target_host,
             target_port,
+            auto_start: row.auto_start != 0,
             created_at: row.created_at,
             updated_at: row.updated_at,
         })
@@ -267,12 +275,32 @@ impl Store {
         sqlx::query(DDL_SESSION).execute(&self.pool).await?;
         sqlx::query(DDL_SESSION_INDEX).execute(&self.pool).await?;
         sqlx::query(DDL_TUNNEL).execute(&self.pool).await?;
+        self.migrate_tunnel_auto_start().await?;
         sqlx::query(DDL_TUNNEL_INDEX).execute(&self.pool).await?;
         sqlx::query(DDL_KNOWN_HOST).execute(&self.pool).await?;
         sqlx::query(DDL_CREDENTIAL).execute(&self.pool).await?;
         sqlx::query(DDL_VAULT_META).execute(&self.pool).await?;
         sqlx::query(DDL_APP_SETTING).execute(&self.pool).await?;
         sqlx::query(DDL_CUSTOM_THEME).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// 给旧库的 tunnel_config 补上 auto_start 列。
+    ///
+    /// 无参数
+    /// 核心流程：先查 pragma_table_info 看列在不在，不在才 ALTER；
+    /// 新库建表时已经带上该列，重复执行 migrate 也不会重复 ALTER 报错。
+    async fn migrate_tunnel_auto_start(&self) -> CoreResult<()> {
+        let present: i64 = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM pragma_table_info('tunnel_config') WHERE name = 'auto_start'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if present == 0 {
+            sqlx::query(DDL_TUNNEL_ADD_AUTO_START)
+                .execute(&self.pool)
+                .await?;
+        }
         Ok(())
     }
 
@@ -1065,14 +1093,15 @@ impl Store {
             listen_port: input.listen_port,
             target_host: input.target_host.trim().to_string(),
             target_port: input.target_port,
+            auto_start: input.auto_start,
             created_at: now,
             updated_at: now,
         };
         sqlx::query(
             "INSERT INTO tunnel_config \
              (id, name, session_id, kind, listen_host, listen_port, target_host, target_port, \
-             created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             auto_start, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )
         .bind(&config.id)
         .bind(&config.name)
@@ -1082,6 +1111,7 @@ impl Store {
         .bind(i64::from(config.listen_port))
         .bind(&config.target_host)
         .bind(i64::from(config.target_port))
+        .bind(i64::from(config.auto_start))
         .bind(config.created_at)
         .bind(config.updated_at)
         .execute(&self.pool)
@@ -1116,13 +1146,15 @@ impl Store {
             listen_port: input.listen_port,
             target_host: input.target_host.trim().to_string(),
             target_port: input.target_port,
+            auto_start: input.auto_start,
             created_at: existing.created_at,
             updated_at,
         };
         sqlx::query(
             "UPDATE tunnel_config SET name = ?1, session_id = ?2, kind = ?3, listen_host = ?4, \
-             listen_port = ?5, target_host = ?6, target_port = ?7, updated_at = ?8 \
-             WHERE id = ?9",
+             listen_port = ?5, target_host = ?6, target_port = ?7, auto_start = ?8, \
+             updated_at = ?9 \
+             WHERE id = ?10",
         )
         .bind(&config.name)
         .bind(&config.session_id)
@@ -1131,6 +1163,7 @@ impl Store {
         .bind(i64::from(config.listen_port))
         .bind(&config.target_host)
         .bind(i64::from(config.target_port))
+        .bind(i64::from(config.auto_start))
         .bind(config.updated_at)
         .bind(&config.id)
         .execute(&self.pool)
