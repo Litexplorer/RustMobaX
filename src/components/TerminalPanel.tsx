@@ -4,8 +4,9 @@ import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import type { ISearchOptions } from "@xterm/addon-search";
 import "@xterm/xterm/css/xterm.css";
+import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import type { Protocol, Session } from "../api/session";
-import { errorDetail, errorKind, errorMessage } from "../api/session";
+import { api, errorDetail, errorKind, errorMessage } from "../api/session";
 import { clampFontSize } from "../api/settings";
 import type { ThemeKind, ThemePalette } from "../lib/themes";
 import { mix, themeToXterm } from "../lib/themes";
@@ -52,6 +53,8 @@ type Props = {
   onCwdChange?: (session: Session, path: string) => void;
   /** 关闭本面板，只有分屏出来的第二块才传，点了回到单栏。 */
   onClosePane?: () => void;
+  /** 关闭整个标签（结束面板的 Enter / 「关闭标签」按钮），由上层从标签列表里移除。 */
+  onCloseTab?: () => void;
   /**
    * 终端建立/销毁时上报后端注册表里的终端 id。
    *
@@ -670,6 +673,20 @@ function buildBanner(options: BannerOptions): string {
   return `\r\n${top}\r\n${row(line2, line2Width)}\r\n${row(line3, line3Width)}\r\n${bottom}\r\n\r\n`;
 }
 
+/**
+ * 生成「保存输出」默认文件名用的本地时间戳。
+ *
+ * 参数：date 为要格式化的时间，缺省取当前时刻
+ * 核心流程：手拼 YYYYMMDD-HHmmss，只依赖本地时区，不引入日期库。
+ */
+function fileStamp(date = new Date()): string {
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return (
+    `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}` +
+    `-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`
+  );
+}
+
 /** 面板向父层暴露的最小能力：把键盘焦点交给本块的 xterm */
 export type TerminalPanelHandle = {
   /** 参数：无，等价于点一下终端本体 */
@@ -699,6 +716,7 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, Props>(
     onHostKeyMismatch,
     onCwdChange,
     onClosePane,
+    onCloseTab,
     onTerminalId,
     banner = true,
     followCwd = true,
@@ -719,6 +737,23 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, Props>(
   const [pendingPaste, setPendingPaste] = useState<string | null>(null);
   /** 搜索条是否打开，供终端内的 Esc 处理读取（避免闭包拿到旧值） */
   const searchOpenRef = useRef(false);
+  /** 最近一次会话的退出码，null 表示不是正常退出（或还没退出），只在结束面板上展示 */
+  const [exitCode, setExitCode] = useState<number | null>(null);
+  /** 结束面板上的临时提示（保存输出成功/失败），null 表示没有 */
+  const [exitNotice, setExitNotice] = useState<string | null>(null);
+  /**
+   * 会话是否已经结束（正常退出或连接失败）。
+   *
+   * 必须用 ref 而不是 status：建连 effect 只跑一次，里面的 keydown 处理器
+   * 闭包拿到的永远是首帧的 status（"starting"），读 state 会导致结束态判不出来。
+   */
+  const endedRef = useRef(false);
+  /** 是否正在重连，防止结束面板上「R 重新连接」被连点两次 */
+  const restartingRef = useRef(false);
+  /** 每次重连自增 -> 让建连 effect 重跑（卸载旧终端并重新建连） */
+  const [restartToken, setRestartToken] = useState(0);
+  /** 手动重连后要不要把焦点交给新终端（新 xterm 不会自动抢焦点） */
+  const focusAfterConnectRef = useRef(false);
 
   useEffect(() => {
     searchOpenRef.current = searchOpen;
@@ -763,9 +798,89 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, Props>(
     termRef.current?.focus();
   }, []);
 
+  /**
+   * 重连（结束面板的 R / 「R 重新连接」按钮）。
+   *
+   * 参数：无
+   * 核心流程：先合上重连闸门防止连点 -> 清掉结束态标记 -> 自增 restartToken 让
+   * 建连 effect 重跑。旧终端与旧后端会话交给 effect 的 cleanup 回收，这里不重复清理；
+   * 重连后 effect 开头会把 restartingRef 复位。
+   */
+  const restart = useCallback(() => {
+    if (restartingRef.current) return;
+    restartingRef.current = true;
+    endedRef.current = false;
+    // 新旧 xterm 是两个实例：不把焦点交接过去的话，按完 R 直接敲键会没人收
+    focusAfterConnectRef.current = true;
+    setStatus("starting");
+    setRestartToken((n) => n + 1);
+  }, []);
+
+  /**
+   * 把终端当前缓冲区导出成纯文本文件（结束面板的 S / 「S 保存输出」按钮）。
+   *
+   * 参数：无
+   * 核心流程：逐行 translateToString（去掉行尾空白）-> 砍掉尾部空行 -> 弹保存对话框 ->
+   * 走已有的 write_text_file 命令写盘。不装 addon-serialize：这里只要人眼可见的文本，
+   * 不需要保留颜色与光标控制序列，手写反而更可控。
+   */
+  const saveOutput = useCallback(async () => {
+    const buf = termRef.current?.buffer.active;
+    if (!buf) return;
+    const lines: string[] = [];
+    for (let i = 0; i < buf.length; i += 1) {
+      lines.push(buf.getLine(i)?.translateToString(true) ?? "");
+    }
+    // 去掉尾部空行：缓冲里未使用的行全是空串，留着会让文件尾巴拖很长一截空白
+    while (lines.length > 0 && lines[lines.length - 1].trim() === "") lines.pop();
+    const text = `${lines.join("\n")}\n`;
+    // 会话名里的 \ / : * ? " < > | 在部分文件系统上非法 -> 统一换成下划线
+    const base = (session.name.trim() || "terminal").replace(/[\\/:*?"<>|]/g, "_");
+    try {
+      const target = await saveDialog({
+        defaultPath: `${base}-${fileStamp()}.txt`,
+        filters: [{ name: "文本", extensions: ["txt"] }],
+      });
+      if (!target) return;
+      await api.writeTextFile(target, text);
+      setExitNotice(`已保存到 ${target}`);
+    } catch (err) {
+      // 失败也放进结束面板的提示行，不静默吞掉
+      setExitNotice(`保存失败：${errorMessage(err)}`);
+    } finally {
+      // 对话框关掉后焦点会飘走 -> 收回终端，否则之后按 R / Enter / S 都没反应
+      termRef.current?.focus();
+    }
+  }, [session.name]);
+
+  /**
+   * 结束面板上的三个动作。
+   *
+   * 参数：无
+   * 核心流程：建连 effect 里的 keydown 处理器按 ref 取当帧实现 -> 关标签回调与
+   * session.name 变化都能跟上，又不用把它们塞进 effect 依赖去重建终端。
+   */
+  const actionsRef = useRef({
+    restart,
+    closeTab: () => onCloseTab?.(),
+    saveOutput,
+  });
+  useEffect(() => {
+    actionsRef.current = { restart, closeTab: () => onCloseTab?.(), saveOutput };
+  });
+
   useEffect(() => {
     const host = hostRef.current;
     if (!host) return undefined;
+
+    // 每次建连（含手动重连）都从「未结束」起步：结束态标记、重连闸门、
+    // 上一次的退出码与提示都必须清掉，否则新终端一挂上就被当成已结束
+    endedRef.current = false;
+    restartingRef.current = false;
+    setStatus("starting");
+    setError(null);
+    setExitCode(null);
+    setExitNotice(null);
 
     const term = new Terminal({
       fontFamily,
@@ -800,6 +915,36 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, Props>(
     term.attachCustomKeyEventHandler((event) => {
       if (event.type !== "keydown") return true;
       const ctrlOrMeta = event.ctrlKey || event.metaKey;
+      /**
+       * 会话结束后键盘改由结束面板接管：R 重连、Enter 关标签、S 保存输出。
+       *
+       * 判定一律读 endedRef（effect 闭包里的 status 永远是首帧值）。其余按键
+       * 全部吞掉 —— 先把 endedRef 设成 true、再 return false，等价于「不转发给后端」，
+       * 顺手消掉了「退出后还往已死的会话写数据 -> 后端返回 Err」的静默 rejection。
+       * 带 Ctrl/Alt/Meta 的组合键照旧放行，全局快捷键（Ctrl+W 关窗、Ctrl+Tab 切标签）不受影响。
+       */
+      if (endedRef.current) {
+        if (event.ctrlKey || event.altKey || event.metaKey) return true;
+        // 走 ref 取最新回调：建连 effect 不会因回调变化而重建终端
+        const actions = actionsRef.current;
+        const key = event.key.toLowerCase();
+        if (key === "r") {
+          event.preventDefault();
+          actions.restart();
+          return false;
+        }
+        if (event.key === "Enter") {
+          event.preventDefault();
+          actions.closeTab();
+          return false;
+        }
+        if (key === "s") {
+          event.preventDefault();
+          actions.saveOutput();
+          return false;
+        }
+        return false;
+      }
       /**
        * 复制：Ctrl+Shift+C 一律复制，Ctrl+C 只在有选区时复制（无选区继续发 SIGINT）。
        *
@@ -837,6 +982,13 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, Props>(
     });
     term.open(host);
     fit.fit();
+
+    // 手动重连（R / 结束面板按钮）后新终端不会自动拿焦点 -> 这里补一次，
+    // 用户按完 R 就能直接接着敲命令，不用再点一下
+    if (focusAfterConnectRef.current) {
+      focusAfterConnectRef.current = false;
+      term.focus();
+    }
 
     let disposed = false;
     let terminalId: string | null = null;
@@ -967,14 +1119,16 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, Props>(
         return;
       }
       setStatus("exited");
+      // 结束态用 ref 记：keydown / onData 都靠它判断，别再往已死的会话写数据。
+      // 退出码存进 state 只为在结束面板上显示；终端里不再另写一行提示，避免和面板重复
+      endedRef.current = true;
+      setExitCode(event.code);
       // 自然退出（exit / Ctrl+D / 远端断开）也要注销终端 id，否则上层会继续
-      // 拿一个已死的 id 采集指标；终端内容保持原样，仍然显示「[会话已结束]」
+      // 拿一个已死的 id 采集指标；终端内容保持原样，由底部结束面板提示后续操作
       if (!exitReported) {
         exitReported = true;
         if (terminalId) onTerminalId?.(session.id, null, terminalId);
       }
-      const suffix = event.code === null ? "" : ` (${event.code})`;
-      term.write(`\r\n\x1b[38;5;244m[会话已结束${suffix}]\x1b[0m\r\n`);
     };
 
     // 按协议查表选启动器 -> 本地起 shell，SSH / Telnet / WSL / 串口各自换后端
@@ -1027,6 +1181,8 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, Props>(
         }
       })
       .catch((reason) => {
+        // 连接失败同样是「结束态」：结束面板换成「连接失败」，R 可以重试
+        endedRef.current = true;
         const kind = errorKind(reason);
         const detail = errorDetail<HostKeyInfo>(reason);
         // 指纹相关的失败需要专门交互，不是普通的连接错误
@@ -1046,8 +1202,11 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, Props>(
         setStatus("error");
       });
 
-    // 键盘输入 -> 编码后写入会话
+    // 键盘输入 -> 编码后写入会话。
+    // 结束态双保险：keydown 已经把普通按键拦掉了，但输入法/粘贴等路径未必走 xterm 的
+    // keydown 编码，那时写进已关闭的会话只会换回一个 Err -> 这里直接丢弃
     const dataSubscription = term.onData((data) => {
+      if (endedRef.current) return;
       if (terminalId) void writeLocalTerminal(terminalId, textToBase64(data));
     });
 
@@ -1116,6 +1275,8 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, Props>(
     onCwdChange,
     onTerminalId,
     closeSearch,
+    // 「R 重新连接」只改这个计数 -> effect 重跑 = 关旧终端、重新建连
+    restartToken,
   ]);
 
   // 字号/字体变化 -> 直接改 xterm 选项再 refit（fit 后会把新行列数同步给远端），
@@ -1180,6 +1341,23 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, Props>(
     termRef.current?.focus();
   };
 
+  /**
+   * 结束面板上的按钮点一下 = 先把焦点还给终端再执行动作。
+   *
+   * 参数：action 为要执行的动作
+   * 核心流程：按钮拿到焦点后按键会被按钮吃掉 -> 动作执行前把焦点交回 xterm，
+   * 这样之后的 R / Enter / S 仍然有效（尤其是保存对话框关闭之后）。
+   */
+  const withTermFocus = (action: () => void) => () => {
+    termRef.current?.focus();
+    action();
+  };
+
+  /** 会话是否已收尾（正常退出或连不上），结束面板与键盘接管都以它为准 */
+  const ended = status === "exited" || status === "error";
+  /** 结束面板右侧那句补充说明：连接失败的原因，或保存输出的结果 */
+  const exitMessage = status === "error" ? error : exitNotice;
+
   return (
     <div className="terminal-panel">
       <div className="terminal-host" ref={hostRef} />
@@ -1205,7 +1383,27 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, Props>(
           </button>
         )}
       </div>
-      {searchOpen && (
+      {ended && (
+        // 结束面板贴在终端底部：一块面板同时说明「怎么结束的」和「接下来能按什么」，
+        // 快捷键与鼠标点击走同一批动作，两者都只是调这三个函数
+        <div className="terminal-exit-bar" role="group" aria-label="会话已结束">
+          <span className="exit-title">
+            {status === "error" ? "连接失败" : `会话已结束${exitCode !== null ? ` (${exitCode})` : ""}`}
+          </span>
+          <button type="button" className="exit-action" onClick={withTermFocus(restart)}>
+            R 重新连接
+          </button>
+          <button type="button" className="exit-action" onClick={withTermFocus(() => onCloseTab?.())}>
+            Enter 关闭标签
+          </button>
+          <button type="button" className="exit-action" onClick={withTermFocus(saveOutput)}>
+            S 保存输出
+          </button>
+          {exitMessage && <span className="exit-notice">{exitMessage}</span>}
+        </div>
+      )}
+      {/* 结束态下搜索条一律不渲染 -> Enter 不会被搜索条抢走 */}
+      {searchOpen && !ended && (
         <TerminalSearchBar
           resultIndex={searchResult.index}
           resultCount={searchResult.count}
@@ -1220,7 +1418,7 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, Props>(
         />
       )}
       {status === "starting" && <div className="terminal-overlay">正在连接…</div>}
-      {status === "error" && <div className="terminal-overlay is-error">{error}</div>}
+      {/* 连接失败的提示已经由上面的结束面板承担，这里不再叠一块居中遮罩 */}
       {pendingPaste !== null && (
         <PasteConfirmDialog text={pendingPaste} onConfirm={confirmPaste} onCancel={cancelPaste} />
       )}

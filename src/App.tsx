@@ -3256,6 +3256,7 @@ function App() {
                       onTerminalId={handleTerminalId}
                       banner={settings.terminalBanner}
                       followCwd={settings.sftpFollowCwd}
+                      onCloseTab={() => closeTab(tab.id)}
                     />
                   </div>
                   {split && (
@@ -3282,6 +3283,7 @@ function App() {
                         banner={settings.terminalBanner}
                         followCwd={settings.sftpFollowCwd}
                         onClosePane={() => toggleSplit(tab.id)}
+                        onCloseTab={() => closeTab(tab.id)}
                       />
                     </div>
                   )}

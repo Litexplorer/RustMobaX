@@ -1458,6 +1458,59 @@ body.is-resizing-sidebar * {
   border-color: var(--border-strong);
 }
 
+/*
+ * 会话结束面板：贴在终端底部的一条操作提示。
+ * 与 .terminal-search 同一套 absolute 浮层范式，一个贴右上、一个贴底部；
+ * 不做动画 -> 退出瞬间不该有任何东西在动，用户是来找操作按钮的。
+ */
+.terminal-exit-bar {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 8px;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 6px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  background: var(--bg-panel);
+  box-shadow: var(--shadow-menu);
+}
+
+.exit-title {
+  color: var(--danger);
+  font-weight: 600;
+  font-size: calc(11px * var(--ui-scale));
+}
+
+.exit-action {
+  padding: 1px 7px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: calc(11px * var(--ui-scale));
+  cursor: pointer;
+}
+
+.exit-action:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* 补充说明（连接失败原因 / 保存结果）：次要信息，压暗且允许换行截断 */
+.exit-notice {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--text-dim);
+  font-size: calc(11px * var(--ui-scale));
+  overflow-wrap: anywhere;
+}
+
 /* 分屏容器：两块面板等宽，各自独立终端 */
 .terminal-split {
   display: flex;
