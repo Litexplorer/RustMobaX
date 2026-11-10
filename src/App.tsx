@@ -3257,6 +3257,7 @@ function App() {
                       banner={settings.terminalBanner}
                       followCwd={settings.sftpFollowCwd}
                       onCloseTab={() => closeTab(tab.id)}
+                      onNotice={(text, tone) => setNotice({ tone: tone ?? "info", text })}
                     />
                   </div>
                   {split && (
@@ -3284,6 +3285,7 @@ function App() {
                         followCwd={settings.sftpFollowCwd}
                         onClosePane={() => toggleSplit(tab.id)}
                         onCloseTab={() => closeTab(tab.id)}
+                        onNotice={(text, tone) => setNotice({ tone: tone ?? "info", text })}
                       />
                     </div>
                   )}

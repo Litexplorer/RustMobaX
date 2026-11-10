@@ -1,10 +1,11 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
-import { Terminal } from "@xterm/xterm";
+import { Terminal, type ILink } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import type { ISearchOptions } from "@xterm/addon-search";
 import "@xterm/xterm/css/xterm.css";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import type { Protocol, Session } from "../api/session";
 import { api, errorDetail, errorKind, errorMessage } from "../api/session";
 import { clampFontSize } from "../api/settings";
@@ -55,6 +56,13 @@ type Props = {
   onClosePane?: () => void;
   /** 关闭整个标签（结束面板的 Enter / 「关闭标签」按钮），由上层从标签列表里移除。 */
   onCloseTab?: () => void;
+  /**
+   * 上报一条状态栏提示，目前只有「打开链接失败」会用到。
+   *
+   * 面板自己不持有全局提示 -> 直接接到上层的 notice 机制上；
+   * tone 缺省按 info 处理，失败类文案传 "error" 让状态栏变红。
+   */
+  onNotice?: (text: string, tone?: "info" | "error") => void;
   /**
    * 终端建立/销毁时上报后端注册表里的终端 id。
    *
@@ -687,6 +695,15 @@ function fileStamp(date = new Date()): string {
   );
 }
 
+/**
+ * 终端里「纯文本 URL」的匹配规则。
+ *
+ * 只认带 scheme 的 http/https（大小写不敏感），并且不吃空白、引号与成对括号 ——
+ * 反过来 file://、ftp://、javascript: 与裸域名都不会命中。带 g 是为了 exec 循环，
+ * 同一份实例被反复使用，每次进 provideLinks 都要把 lastIndex 归零。
+ */
+const URL_PATTERN = /https?:\/\/[^\s"'`<>()[\]{}]+/gi;
+
 /** 面板向父层暴露的最小能力：把键盘焦点交给本块的 xterm */
 export type TerminalPanelHandle = {
   /** 参数：无，等价于点一下终端本体 */
@@ -717,6 +734,7 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, Props>(
     onCwdChange,
     onClosePane,
     onCloseTab,
+    onNotice,
     onTerminalId,
     banner = true,
     followCwd = true,
@@ -869,6 +887,18 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, Props>(
     actionsRef.current = { restart, closeTab: () => onCloseTab?.(), saveOutput };
   });
 
+  /**
+   * 提示通道。
+   *
+   * 放 ref 而不是让建连 effect 直接闭包取：上层传进来的 onNotice 是个内联箭头函数，
+   * 每次渲染都换引用 -> 塞进依赖数组会让建连 effect 反复重跑（等于把会话掐了）；
+   * 这里每次渲染同步一次，effect 里读到的永远是最新那份。
+   */
+  const noticeRef = useRef(onNotice);
+  useEffect(() => {
+    noticeRef.current = onNotice;
+  });
+
   useEffect(() => {
     const host = hostRef.current;
     if (!host) return undefined;
@@ -882,6 +912,46 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, Props>(
     setExitCode(null);
     setExitNotice(null);
 
+    /**
+     * 用系统默认浏览器打开一个链接。
+     *
+     * 参数：text 为要打开的地址（调用方已保证是 http/https）
+     * 核心流程：先把 scheme 归一成小写再交给 Tauri 的 opener 插件走系统默认应用；
+     * 失败绝不静默 —— 用户在终端里点了没反应只会当成 bug，所以把错误文案送到状态栏。
+     *
+     * scheme 必须归一：终端里可能输出 HTTPS:// 这种大写，而 capability 的
+     * url glob 是大小写敏感的，放行它的只有 https://*，大写会被插件拒掉。
+     */
+    const openWithBrowser = (text: string) => {
+      const target = text.replace(/^(https?):\/\//i, (_, scheme: string) => `${scheme.toLowerCase()}://`);
+      openUrl(target).catch((err) => {
+        noticeRef.current?.(`打开链接失败：${errorMessage(err)}`, "error");
+      });
+    };
+
+    /**
+     * 链接激活的唯一闸门（OSC 8 与纯文本 URL 共用）。
+     *
+     * 参数：event 为触发点击的鼠标事件，text 为该链接的地址
+     * 核心流程：只放行 http/https；必须按住 Ctrl（mac 上是 Cmd）才交给系统浏览器。
+     * 不满足时什么都不做，尤其**不能** preventDefault —— 否则普通左键的拖选会被吃掉。
+     *
+     * 收成具名函数而不是两处各写一遍：linkHandler.activate（三参）与
+     * ILink.activate（两参）都指向它，判据只有这一份，不会漂移。
+     */
+    const activateLink = (event: MouseEvent, text: string) => {
+      // 只认 http/https：OSC 8 里可能塞 javascript: 之类的伪协议
+      if (!/^https?:\/\//i.test(text)) return;
+      // 非 Ctrl 的点击什么都不做，且不能 preventDefault -> 否则拖选被吃掉
+      if (!(event.ctrlKey || event.metaKey)) return;
+      event.preventDefault();
+      openWithBrowser(text);
+    };
+    // xterm 自己会给链接加 pointer 光标与下划线，这个 class 只留作样式钩子；
+    // hover/leave 可能在该元素卸载后才被调 -> 走 ref 判空
+    const enterLink = () => hostRef.current?.classList.add("is-link-hover");
+    const leaveLink = () => hostRef.current?.classList.remove("is-link-hover");
+
     const term = new Terminal({
       fontFamily,
       fontSize,
@@ -894,6 +964,19 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, Props>(
       // findNext/findPrevious 会直接抛 "You must set the allowProposedApi
       // option to true to use proposed API"，于是一个都搜不到、也跳不动。
       allowProposedApi: true,
+      /**
+       * 终端里的链接交给系统默认浏览器打开。
+       *
+       * 必须自己把 Ctrl（mac 上是 Cmd）这道闸：xterm 的 Linkifier.handleMouseUp 不判
+       * 修饰键 —— mousedown / mouseup 落在同一个链接上就直接调 activate，不拦的话
+       * 普通左键点一下链接也会弹浏览器，还会跟拖选抢事件。
+       */
+      linkHandler: {
+        // OSC 8 超链接继续走这条路，与下面纯文本 URL 的 provider 共用同一份闸门
+        activate: activateLink,
+        hover: enterLink,
+        leave: leaveLink,
+      },
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
@@ -981,6 +1064,68 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, Props>(
       return true;
     });
     term.open(host);
+
+    /**
+     * 纯文本 URL 的链接识别。
+     *
+     * xterm 6 核心只给 OSC 8 转义序列里的地址建链接（内置 OscLinkProvider），
+     * 命令行里直接打印出来的普通 http(s) 地址没有链接对象 -> 没有下划线、点了没反应。
+     * 这里补一个 provider 填上这一路：只认带 scheme 的 http/https，
+     * 不做跨行合并，也不认 file://、ftp://、javascript: 之类的协议。
+     *
+     * 坐标全 1-based（IBufferRange 约定）：start.x 是首格列号，end.x 是**末格列号（含）**，
+     * 与核心 OscLinkProvider 的取值方式一致 —— 写成「末格 + 1」会让下划线多出一格。
+     * 回调里只处理传入的那一行：Linkifier 在悬停/重绘时会按行反复调用这里。
+     */
+    const linkProviderDisposable = term.registerLinkProvider({
+      provideLinks: (bufferLineNumber, callback) => {
+        // 回调给的行号是 1-based 的 buffer 行（Linkifier 传的是视口行 + ydisp），
+        // 而 IBuffer.getLine 收 0-based 的绝对行下标
+        const line = term.buffer.active.getLine(bufferLineNumber - 1);
+        if (!line) {
+          callback(undefined);
+          return;
+        }
+        // 绝大多数行里没有地址：先做一次便宜的整行判定，命中才走逐格重建
+        if (!/https?:\/\//i.test(line.translateToString(true))) {
+          callback(undefined);
+          return;
+        }
+        // 逐格拼一份「一格一字符」的行文本。translateToString 会把宽字符（中文、emoji）
+        // 压成 1 个字符串下标却仍占 2 个终端列，直接拿 match.index 当列号会让链接整体左移；
+        // 按每格宽度补齐后，字符串下标就等于 0-based 列号。
+        const cell = term.buffer.active.getNullCell();
+        let text = "";
+        for (let x = 0; x < line.length; ) {
+          line.getCell(x, cell);
+          const chars = cell.getChars();
+          const width = cell.getWidth() || 1;
+          text += chars.length === width ? chars : chars.slice(0, width).padEnd(width, " ");
+          // 宽字符的后半格是空壳，不能再算一列（translateToString 同样按宽度跳格）
+          x += width;
+        }
+        const links: ILink[] = [];
+        URL_PATTERN.lastIndex = 0;
+        for (let match = URL_PATTERN.exec(text); match; match = URL_PATTERN.exec(text)) {
+          let url = match[0];
+          // 剥掉句末标点：英文句子里的 "见 https://a.com/x." 句号不属于地址。
+          // 括号类字符已被正则排除，这里只兜标点。
+          while (url.length > 0 && /[.,;:!?)]$/.test(url)) url = url.slice(0, -1);
+          if (!/^https?:\/\/.+/i.test(url)) continue;
+          links.push({
+            range: {
+              start: { x: match.index + 1, y: bufferLineNumber },
+              end: { x: match.index + url.length, y: bufferLineNumber },
+            },
+            text: url,
+            activate: activateLink,
+            hover: enterLink,
+            leave: leaveLink,
+          });
+        }
+        callback(links.length > 0 ? links : undefined);
+      },
+    });
     fit.fit();
 
     // 手动重连（R / 结束面板按钮）后新终端不会自动拿焦点 -> 这里补一次，
@@ -1251,6 +1396,7 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, Props>(
       observer.disconnect();
       window.removeEventListener("resize", refit);
       dataSubscription.dispose();
+      linkProviderDisposable.dispose();
       searchResultsSubscription.dispose();
       cwdSubscription.dispose();
       searchApiRef.current = null;

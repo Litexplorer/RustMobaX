@@ -79,13 +79,14 @@ fn clamp_to_min_size<R: tauri::Runtime>(window: &tauri::Window<R>, size: &tauri:
 /// 启动应用主循环。
 ///
 /// 无参数
-/// 核心流程：注册文件对话框插件 → 注册窗口位置尺寸记忆插件 →
+/// 核心流程：注册文件对话框插件 → 注册系统浏览器打开链接插件 → 注册窗口位置尺寸记忆插件 →
 /// 兜底夹紧最小尺寸 → 打开会话库并注册为共享状态 → 注册全部 IPC 命令 →
 /// 进入事件循环。
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         // 保存的位置不与任何显示器相交时（例如外接屏被拔掉），插件会跳过
         // set_position，窗口留在 tauri.conf.json 的默认位置，不会跑到屏幕外。
         .plugin(
