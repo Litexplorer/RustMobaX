@@ -1,6 +1,7 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { Terminal, type ILink } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { ImageAddon } from "@xterm/addon-image";
 import { SearchAddon } from "@xterm/addon-search";
 import type { ISearchOptions } from "@xterm/addon-search";
 import "@xterm/xterm/css/xterm.css";
@@ -982,6 +983,12 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, Props>(
     term.loadAddon(fit);
     const search = new SearchAddon();
     term.loadAddon(search);
+    // 装载图片解析插件 -> 终端可渲染 Sixel / iTerm2 内联图片（图片缓存 32MB、单图 8M 像素封顶挡超大图）
+    const imageAddon = new ImageAddon({
+      storageLimit: 32,
+      pixelLimit: 8388608,
+    });
+    term.loadAddon(imageAddon);
     termRef.current = term;
     searchApiRef.current = {
       find: (query, backwards) => {
