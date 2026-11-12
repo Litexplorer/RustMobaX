@@ -722,7 +722,7 @@ export function SettingsDialog({
                   step={(delta) => setFontSize(settings.terminalFontSize + delta)}
                 />
                 <span className="setting-note" id="settings-font-size-hint">
-                  {FONT_SIZE_MIN} ~ {FONT_SIZE_MAX}，也可在终端里 Ctrl + 滚轮调整
+                  {FONT_SIZE_MIN} ~ {FONT_SIZE_MAX}，也可在终端里 Ctrl + Shift + 滚轮调整
                 </span>
               </div>
             </div>

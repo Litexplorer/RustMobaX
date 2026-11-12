@@ -41,7 +41,7 @@ type Props = {
   fontSize: number;
   /** 终端字体族（CSS font-family 字符串），由 App 从预设映射而来 */
   fontFamily: string;
-  /** Ctrl + 滚轮调整字号后回调，持久化由 App 负责 */
+  /** Ctrl + Shift + 滚轮调整字号后回调，持久化由 App 负责 */
   onFontSizeChange?: (next: number) => void;
   /** SSH 认证方式，仅在内存中传递。 */
   sshAuth?: SshAuthRequest | null;
@@ -1073,6 +1073,51 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, Props>(
     term.open(host);
 
     /**
+     * 纯滚动：Ctrl+滚轮 / Ctrl+PageUp / Ctrl+PageDown 只动本地回滚区。
+     *
+     * 三个动作都只改 xterm 的视口偏移（ydisp）：不写 PTY、不移动光标，也不产生任何字节。
+     * 监听挂在 host 的捕获阶段并在命中时 stopPropagation —— xterm 自己的滚轮/按键处理
+     * 挂在 .xterm-viewport、textarea 这些后代元素上，捕获阶段掐断后它们收不到事件，
+     * 于是远端开了鼠标上报（vim / less / htop）也拿不到滚轮或 PageUp，不会被编成
+     * ESC[<…M / ESC[5~ 发过去。
+     *
+     * 两个 options 对象在 add / remove 之间复用：removeEventListener 只按 capture 匹配，
+     * 用同一份对象既省心又不会写错，终端重建时成对解绑。
+     */
+    // 拦截 Ctrl+滚轮 -> 只滚动本地回滚区，不移动光标也不上报给应用
+    const scrollWheel = (event: WheelEvent) => {
+      // 没按 Ctrl 就完全不碰 -> xterm 原生滚轮与鼠标上报保持原样；
+      // 带 Shift 的 Ctrl+滚轮留给下面的字号缩放
+      if (!event.ctrlKey || event.shiftKey) return;
+      event.preventDefault();
+      event.stopPropagation();
+      // 备用屏幕没有回滚区：事件已经吃掉，这里直接返回，别把它透成鼠标上报
+      if (term.buffer.active.type === "alternate") return;
+      // 与字号缩放同一套兜底：纵向量可能落在 deltaX 上（WebKitGTK 的 Shift 重映射、
+      // 只会报横向的滚轮/触控板），deltaY 为 0 时退回 deltaX，否则这里一 return 就滚不动。
+      // 事件此时已被 preventDefault + stopPropagation，兜底只影响本地视口，不会发给远端。
+      const delta = event.deltaY !== 0 ? event.deltaY : event.deltaX;
+      if (delta === 0) return;
+      // 增量换算成行数并带下限：一次滚动至少 3 行，触控板的碎步长也不会卡成一格
+      const lines = Math.max(1, Math.round(Math.abs(delta) / 50)) * 3;
+      term.scrollLines(delta < 0 ? -lines : lines);
+    };
+    // 拦截 Ctrl+PageUp / Ctrl+PageDown -> 只翻本地回滚页，不移动光标也不上报给应用
+    const scrollKey = (event: KeyboardEvent) => {
+      // 只认干净的 Ctrl+PageUp/PageDown，Ctrl+Shift/Alt 的组合一律放过
+      if (!event.ctrlKey || event.shiftKey || event.altKey) return;
+      if (event.key !== "PageUp" && event.key !== "PageDown") return;
+      event.preventDefault();
+      event.stopPropagation();
+      // scrollPages 在备用屏幕里本来就不动（无回滚区），这里不用再判
+      term.scrollPages(event.key === "PageUp" ? -1 : 1);
+    };
+    const scrollWheelOptions: AddEventListenerOptions = { capture: true, passive: false };
+    const scrollKeyOptions: AddEventListenerOptions = { capture: true };
+    host.addEventListener("wheel", scrollWheel, scrollWheelOptions);
+    host.addEventListener("keydown", scrollKey, scrollKeyOptions);
+
+    /**
      * 纯文本 URL 的链接识别。
      *
      * xterm 6 核心只给 OSC 8 转义序列里的地址建链接（内置 OscLinkProvider），
@@ -1395,6 +1440,9 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, Props>(
       host.removeEventListener("paste", handlePaste, true);
       host.removeEventListener("pointerdown", claimByUser, true);
       host.removeEventListener("focusin", claimByUser, true);
+      // 与注册时同一个 options 对象 -> 成对解绑，重建终端不会叠加监听
+      host.removeEventListener("wheel", scrollWheel, scrollWheelOptions);
+      host.removeEventListener("keydown", scrollKey, scrollKeyOptions);
       textarea?.removeEventListener("focus", claimByUser);
       visibility.disconnect();
       if (cwdTimer !== null) clearInterval(cwdTimer);
@@ -1452,19 +1500,24 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, Props>(
     return undefined;
   }, [theme]);
 
-  // Ctrl + 滚轮缩放字号：拦掉浏览器默认缩放，一次滚动只调 1px，
-  // 夹在 10 ~ 24；持久化交给 App 的 saveSetting（同 key 300ms 防抖）
+  // Ctrl + Shift + 滚轮缩放字号：拦掉浏览器默认缩放，一次滚动只调 1px，
+  // 夹在 10 ~ 24；持久化交给 App 的 saveSetting（同 key 300ms 防抖）。
+  // 裸 Ctrl + 滚轮已让给本地回滚（见上面的 scrollWheel），这里必须带上 Shift 才认，
+  // 否则同一个事件会既滚动又改字号。
   useEffect(() => {
     const host = hostRef.current;
     if (!host) return undefined;
     const handleWheel = (event: WheelEvent) => {
-      if (!event.ctrlKey) return;
+      if (!event.ctrlKey || !event.shiftKey) return;
       event.preventDefault();
-      if (event.deltaY === 0) return;
-      const next = clampFontSize(fontSize + (event.deltaY < 0 ? 1 : -1));
+      // WebKitGTK 把 Shift+滚轮当成横向滚动：纵向量落在 deltaX、deltaY 恒为 0。
+      // 所以先取 deltaY，为 0 时退回 deltaX，否则这里一 return 缩放就彻底失效。
+      const delta = event.deltaY !== 0 ? event.deltaY : event.deltaX;
+      if (delta === 0) return;
+      const next = clampFontSize(fontSize + (delta < 0 ? 1 : -1));
       if (next !== fontSize) onFontSizeChange?.(next);
     };
-    // 捕获阶段监听 -> 先于 xterm 自己的滚轮处理执行，Ctrl+滚轮不会被它吃掉
+    // 捕获阶段监听 -> 先于 xterm 自己的滚轮处理执行，Ctrl+Shift+滚轮不会被它吃掉
     host.addEventListener("wheel", handleWheel, { passive: false, capture: true });
     return () => host.removeEventListener("wheel", handleWheel, { capture: true });
   }, [fontSize, onFontSizeChange]);
