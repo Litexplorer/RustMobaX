@@ -1,4 +1,4 @@
-import type { SessionGroup } from "../api/session";
+import type { Session, SessionGroup } from "../api/session";
 
 /**
  * 求分组从根到自身的名称链。
@@ -52,4 +52,34 @@ export function compareGroup(a: SessionGroup, b: SessionGroup): number {
  */
 export function hasChildGroups(groups: SessionGroup[], id: string): boolean {
   return groups.some((group) => group.parentId === id);
+}
+
+/**
+ * 首界面搜索框的关键字过滤。
+ *
+ * 参数：sessions 为待搜索会话（返回值保持它的原始顺序），groups 为全部分组
+ * （用来把 groupId 还原成可搜索的分组全路径），query 为用户输入
+ * 核心流程：关键字去首尾空白并转小写后，对名称、主机、用户名、端口、协议、
+ * 分组全路径逐一做子串匹配，任一命中即保留；空关键字直接返回空数组，
+ * 让首界面一进来不铺满整屏会话；不做排序，结果顺序由调用方传入的顺序决定。
+ */
+export function filterSessions(
+  sessions: Session[],
+  groups: SessionGroup[],
+  query: string,
+): Session[] {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return [];
+
+  return sessions.filter((session) => {
+    const fields = [
+      session.name,
+      session.host ?? "",
+      session.username ?? "",
+      session.port === null ? "" : String(session.port),
+      session.protocol,
+      groupPath(groups, session.groupId).join(" / "),
+    ];
+    return fields.some((field) => field.toLowerCase().includes(needle));
+  });
 }

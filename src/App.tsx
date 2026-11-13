@@ -63,6 +63,7 @@ import { KnownHostsDialog } from "./components/KnownHostsDialog";
 import { TunnelDialog } from "./components/TunnelDialog";
 import { TunnelFormDialog } from "./components/TunnelFormDialog";
 import { CommandPalette } from "./components/CommandPalette";
+import { HomeSessionSearch } from "./components/HomeSessionSearch";
 import { tunnelConfigList, tunnelList, tunnelStart } from "./api/tunnel";
 import type { TunnelConfig, TunnelInfo } from "./api/tunnel";
 import { TerminalPanel } from "./components/TerminalPanel";
@@ -3494,6 +3495,11 @@ function App() {
                 </div>
                 <h2>RustMobaX</h2>
                 <p>从左侧会话树双击，或用 Quick connect 输入 user@host:port</p>
+                <HomeSessionSearch
+                  sessions={sessions}
+                  groups={groups}
+                  onOpen={(session) => void openSession(session)}
+                />
                 <div className="welcome-actions">
                   <button
                     type="button"
