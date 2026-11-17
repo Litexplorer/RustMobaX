@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import { useEscapeClose } from "../lib/useEscapeClose";
 
 type Props = {
@@ -36,6 +37,30 @@ export function PasteConfirmDialog({ text, onConfirm, onCancel }: Props) {
 
   // 确认类弹窗：Esc = 取消粘贴，内容不会写进终端
   useEscapeClose(onCancel);
+
+  // 弹窗挂载期间按 Enter -> 确认粘贴，回车在 window 捕获阶段就被掐断，终端收不到 \r
+  // 这里不重复实现 Esc：useEscapeClose 已经在 window 捕获阶段统一接管，重复挂同一个键只会互相顶掉
+  // 只 preventDefault 不够：xterm 不检查 defaultPrevented，必须在捕获阶段 stopPropagation 拦住事件继续下沉
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Enter") return;
+      // 输入法组字中的 Enter 属于输入法，不抢
+      if (event.isComposing) return;
+      event.preventDefault();
+      event.stopPropagation();
+      // 确认只做粘贴、不追加回车：多行粘贴的本意就是防误执行，回车交给用户自己敲
+      onConfirm();
+    };
+    window.addEventListener("keydown", handleKeyDown, true);
+    return () => window.removeEventListener("keydown", handleKeyDown, true);
+  }, [onConfirm]);
+
+  // 弹窗挂载时 -> 把焦点从终端摘走，弹窗期间的其它按键不会静默漏进远端 shell
+  // 卸载时不在这里抢焦点：TerminalPanel 的 confirmPaste/cancelPaste 已负责把焦点还给终端
+  useEffect(() => {
+    const active = document.activeElement;
+    if (active instanceof HTMLElement && active.closest(".xterm")) active.blur();
+  }, []);
 
   return (
     <div className="modal-backdrop" role="presentation">
