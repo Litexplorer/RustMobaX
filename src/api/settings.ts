@@ -34,6 +34,11 @@ export const SIDEBAR_TABS: SidebarTab[] = ["sessions", "tools", "macros", "sftp"
 export const SFTP_WIDTH_MIN = 260;
 export const SFTP_WIDTH_MAX = 520;
 
+/** MCP 服务监听端口的合法区间与缺省值（避开需要 root 权限的低位端口） */
+export const MCP_PORT_MIN = 1024;
+export const MCP_PORT_MAX = 65535;
+export const MCP_PORT_DEFAULT = 47821;
+
 /**
  * 前端使用的强类型设置。
  *
@@ -67,6 +72,10 @@ export type AppSettings = {
   sftpWidth: number;
   /** 文件分页是否跟随终端上报的工作目录 */
   sftpFollowCwd: boolean;
+  /** 是否启用内置的 MCP 服务 */
+  mcpEnabled: boolean;
+  /** MCP 服务监听端口，1024 ~ 65535 */
+  mcpPort: number;
   /** 可配置快捷键：动作 id 到组合 */
   shortcuts: ShortcutMap;
 };
@@ -86,6 +95,8 @@ export const SETTING_KEYS: Record<keyof AppSettings, string> = {
   // 库里的旧值原样保留不删，需要时仍可人工回滚
   sftpWidth: "sftp.width",
   sftpFollowCwd: "sftp.followCwd",
+  mcpEnabled: "mcp.enabled",
+  mcpPort: "mcp.port",
   shortcuts: "shortcuts",
 };
 
@@ -115,6 +126,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
   terminalBanner: true,
   sftpWidth: 280,
   sftpFollowCwd: true,
+  // 默认关闭：没有显式打开就不监听任何端口
+  mcpEnabled: false,
+  mcpPort: MCP_PORT_DEFAULT,
   shortcuts: DEFAULT_SHORTCUTS,
 };
 
@@ -181,6 +195,21 @@ function parseFlag(raw: string | undefined, fallback: boolean): boolean {
 }
 
 /**
+ * 解析 MCP 监听端口。
+ *
+ * 参数：raw 为库里的原值，可能是缺失、非数字或超界
+ * 核心流程：非整数、超出 1024 ~ 65535 一律回落缺省端口，不抛异常 ->
+ * 脏值不会让监听失败，用户重新选一次即可。
+ */
+function parseMcpPort(raw: string | undefined): number {
+  const value = parseNumber(raw, MCP_PORT_DEFAULT);
+  if (!Number.isInteger(value) || value < MCP_PORT_MIN || value > MCP_PORT_MAX) {
+    return MCP_PORT_DEFAULT;
+  }
+  return value;
+}
+
+/**
  * 把缩放系数夹到合法区间并对齐步长。
  *
  * 参数：value 为任意数值
@@ -214,7 +243,7 @@ export function clampSftpWidth(value: number): number {
 /**
  * 把设置值序列化成后端要的字符串。
  *
- * 参数：value 为布尔、数字或字符串
+ * 参数：value 为布尔、数字、字符串或快捷键表（含 MCP 开关与端口）
  * 核心流程：布尔统一成 "1"/"0"，数字交给 String，和后端约定一致。
  */
 export function serializeSetting(value: string | number | boolean | ShortcutMap): string {
@@ -305,6 +334,8 @@ export function parseSettings(raw: Record<string, string>): AppSettings {
       parseNumber(raw[SETTING_KEYS.sftpWidth], DEFAULT_SETTINGS.sftpWidth),
     ),
     sftpFollowCwd: parseFlag(raw[SETTING_KEYS.sftpFollowCwd], DEFAULT_SETTINGS.sftpFollowCwd),
+    mcpEnabled: parseFlag(raw[SETTING_KEYS.mcpEnabled], DEFAULT_SETTINGS.mcpEnabled),
+    mcpPort: parseMcpPort(raw[SETTING_KEYS.mcpPort]),
     shortcuts: parseShortcuts(raw[SETTING_KEYS.shortcuts]),
   };
 }

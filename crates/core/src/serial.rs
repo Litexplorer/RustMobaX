@@ -16,7 +16,7 @@ use serialport::{DataBits, FlowControl, Parity, StopBits, SerialPortType};
 use serde::Serialize;
 
 use crate::error::{CoreError, CoreResult};
-use crate::terminal::{start_output_pump, OutputSink, TerminalControl};
+use crate::terminal::{start_output_pump, OutputSink, Pump, TerminalControl};
 
 /// 单次从串口读取的最大字节数（与本地 PTY / Telnet 的读取粒度保持一致）。
 const READ_CHUNK: usize = 8192;
@@ -232,6 +232,8 @@ pub struct SerialSession {
     writer: Mutex<Option<Box<dyn serialport::SerialPort>>>,
     /// 与读线程共享的关闭标志：串口没有 shutdown，只能靠它让读线程退出。
     closed: Arc<AtomicBool>,
+    /// 输出泵句柄：读屏时按游标取历史输出
+    pump: Arc<Pump>,
 }
 
 impl SerialSession {
@@ -296,6 +298,7 @@ impl SerialSession {
         Ok(Self {
             writer: Mutex::new(Some(port)),
             closed,
+            pump,
         })
     }
 
@@ -358,6 +361,14 @@ impl TerminalControl for SerialSession {
     /// 关闭即释放设备。
     fn close(&self) -> CoreResult<()> {
         SerialSession::close(self)
+    }
+
+    /// 从输出泵的回滚缓冲里按游标读一段。
+    ///
+    /// 参数：cursor 为上次返回的 next，max 为本次最多取的字节数
+    /// 核心流程：缓冲与读线程共享，直接按游标读当前位置即可。
+    fn scrollback(&self, cursor: u64, max: usize) -> Option<crate::scrollback::ScrollbackChunk> {
+        Some(self.pump.scrollback().read(cursor, max))
     }
 }
 

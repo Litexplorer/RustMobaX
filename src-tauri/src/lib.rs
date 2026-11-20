@@ -1,4 +1,5 @@
 mod commands;
+mod mcp;
 mod state;
 
 use tauri::Manager;
@@ -109,6 +110,14 @@ pub fn run() {
             let db_path = data_dir.join("sessions.db");
             let state = tauri::async_runtime::block_on(build_state(&db_path))?;
             app.manage(state);
+            app.manage(mcp::state());
+            // MCP 服务是可选能力，端口被占用或设置写坏时只记录原因，
+            // 不让整个应用起不来。
+            if let Err(error) =
+                tauri::async_runtime::block_on(mcp::apply_from_settings(&app.handle().clone()))
+            {
+                eprintln!("MCP 服务未能启动：{}", error.message);
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -129,6 +138,10 @@ pub fn run() {
             commands::session::export_sessions,
             commands::settings::settings_get_all,
             commands::settings::settings_set,
+            mcp::mcp_status,
+            mcp::mcp_reset_token,
+            mcp::mcp_apply,
+            mcp::mcp_audit,
             commands::theme::theme_list_custom,
             commands::theme::theme_save_custom,
             commands::theme::theme_delete_custom,

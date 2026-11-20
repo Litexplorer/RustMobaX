@@ -10,10 +10,13 @@ mod import;
 mod metrics;
 mod metrics_remote;
 mod model;
+mod registry;
 /// 远程桌面：检测本机的 RDP / VNC 客户端并拼出启动参数，命令层直接用这个命名空间。
 pub mod remote_desktop;
 /// 串口：枚举本机设备与裸字节收发，命令层直接用这个命名空间。
 pub mod serial;
+/// 回滚缓冲：按游标增量读取终端历史输出，命令层直接用这个命名空间。
+mod scrollback;
 mod sftp;
 mod ssh;
 mod store;
@@ -36,14 +39,17 @@ pub use model::{
     default_tunnel_name, AuthKind, Protocol, Session, SessionGroup, SessionInput, TunnelConfig,
     TunnelConfigInput,
 };
+pub use registry::TerminalRegistry;
 pub use remote_desktop::{build_launch_args, detect_clients, launch, RemoteDesktopClient};
 pub use serial::{SerialOptions, SerialPortInfo, SerialSession};
 pub use sftp::{SftpClient, SftpEntry, TransferOutcome, DEFAULT_TRANSFER_CHUNK, PART_SUFFIX};
+pub use scrollback::{Scrollback, ScrollbackChunk, DEFAULT_SCROLLBACK_CAPACITY};
 pub use ssh::{
     ForwardedChannel, SshAuth, SshChannel, SshConnection, SshOptions, SshSession,
 };
 pub use store::{
-    Credential, CustomTheme, KnownHost, Store, THEME_NAME_MAX_BYTES, THEME_PAYLOAD_MAX_BYTES,
+    Credential, CustomTheme, KnownHost, McpAuditEntry, Store, MCP_AUDIT_DEFAULT_ROWS,
+    MCP_AUDIT_MAX_ROWS, THEME_NAME_MAX_BYTES, THEME_PAYLOAD_MAX_BYTES,
 };
 pub use terminal::{
     default_shell, OutputSink, TerminalControl, TerminalOptions, TerminalOutput, TerminalSession,

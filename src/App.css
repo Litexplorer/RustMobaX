@@ -3036,6 +3036,53 @@ body.is-resizing-sidebar * {
   font-size: calc(12px * var(--ui-scale));
 }
 
+/* 隧道搜索框：复用侧栏 .tree-search 的外观，但它横排在工具栏里，
+   所以去掉自带的下外边距，限一个最大宽度，剩下的横向空当由 flex 吃掉 */
+.tunnel-search {
+  margin-bottom: 0;
+  flex: 1;
+  max-width: 320px;
+}
+
+/* .tree-search 原本是整行容器，输入框按 size 定宽；
+   放进定宽容器后让它铺满图标与内边距之外的剩余宽度 */
+.tunnel-search input {
+  flex: 1;
+  min-width: 0;
+}
+
+/* 分页条：贴在表格下沿右对齐；两个翻页按钮套用 .tunnel-row-actions，
+   尺寸与配色跟表格行内小按钮一致，不另造一套按钮样式 */
+.tunnel-pager {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 8px;
+  color: var(--text-dim);
+  font-size: calc(11px * var(--ui-scale));
+}
+
+/* 条数与页码不参与压缩，窗口偏窄时先挤下拉与按钮 */
+.tunnel-pager-count,
+.tunnel-pager-page {
+  white-space: nowrap;
+}
+
+/* 「每页」标签 + 下拉：全局 input / select 是 width: 100%，这里按内容定宽 */
+.tunnel-pager-size {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.tunnel-pager-size select {
+  width: auto;
+  padding: 2px 4px;
+  font-size: calc(11px * var(--ui-scale));
+}
+
 /* 字段级校验错误：紧贴对应输入框下方，左侧缩进对齐输入列 */
 p.setting-error {
   margin: -4px 0 8px 138px;

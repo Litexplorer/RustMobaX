@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::error::{CoreError, CoreResult};
-use crate::terminal::{start_output_pump, OutputSink, TerminalControl};
+use crate::terminal::{start_output_pump, OutputSink, Pump, TerminalControl};
 
 /// 单次从 socket 读取的最大字节数（与本地 PTY 的读取粒度保持一致）。
 const READ_CHUNK: usize = 8192;
@@ -349,6 +349,8 @@ pub struct TelnetSession {
     /// 只用于 close：shutdown 之后阻塞中的读线程会立刻读到 EOF 并收尾输出泵。
     handle: TcpStream,
     closed: AtomicBool,
+    /// 输出泵句柄：读屏时按游标取历史输出
+    pump: Arc<Pump>,
 }
 
 impl TelnetSession {
@@ -470,6 +472,7 @@ impl TelnetSession {
             parser,
             handle,
             closed: AtomicBool::new(false),
+            pump,
         })
     }
 
@@ -547,6 +550,14 @@ impl TerminalControl for TelnetSession {
     /// 关闭即断开 socket。
     fn close(&self) -> CoreResult<()> {
         TelnetSession::close(self)
+    }
+
+    /// 从输出泵的回滚缓冲里按游标读一段。
+    ///
+    /// 参数：cursor 为上次返回的 next，max 为本次最多取的字节数
+    /// 核心流程：缓冲与读线程共享，直接按游标读当前位置即可。
+    fn scrollback(&self, cursor: u64, max: usize) -> Option<crate::scrollback::ScrollbackChunk> {
+        Some(self.pump.scrollback().read(cursor, max))
     }
 }
 

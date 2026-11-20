@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { api, errorDetail, errorKind, errorMessage } from "./api/session";
 import {
@@ -127,6 +128,19 @@ type DialogState =
   | { kind: "about" };
 
 type Notice = { tone: "info" | "error"; text: string };
+
+/** agent 打开 SSH 终端后后端推来的事件负载（camelCase）。 */
+type TerminalOpened = {
+  terminalId: string;
+  sessionId: string;
+  cols: number;
+  rows: number;
+};
+
+/** agent 改动会话库或设置后后端推来的事件负载（camelCase）。 */
+type McpChanged = {
+  kind: "sessions" | "groups" | "settings";
+};
 
 /** RDP / VNC 会话的实际端口：没填就按协议回落到默认值，与后端 `effective_port()` 一致。 */
 function remoteDesktopPort(session: Session): number {
@@ -655,6 +669,36 @@ function App() {
   }, [loadSettings]);
 
   /**
+   * 监听 agent 打开终端的事件。
+   *
+   * 参数：无
+   * 核心流程：后端连上会话后推 terminal:opened -> 按会话标识查名字 ->
+   * 在状态栏提示一句。纯通知，不弹框也不阻断当前操作；卸载或会话列表变化时退订。
+   */
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let disposed = false;
+    void listen<TerminalOpened>("terminal:opened", (event) => {
+      const name = sessions.find((item) => item.id === event.payload.sessionId)?.name;
+      setNotice({
+        tone: "info",
+        text: `Agent 已打开 SSH 终端：${name ?? event.payload.sessionId}`,
+      });
+    })
+      .then((stop) => {
+        if (disposed) stop();
+        else unlisten = stop;
+      })
+      .catch(() => {
+        // 订阅失败只丢这一条通知，界面照常可用
+      });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [sessions]);
+
+  /**
    * 拉取自定义主题列表。
    *
    * 参数：无
@@ -763,6 +807,35 @@ function App() {
       void reload(keyword);
     }, 150);
     return () => window.clearTimeout(timer);
+  }, [keyword, reload]);
+
+  /**
+   * 监听 agent 改动会话库或设置的事件。
+   *
+   * 参数：无
+   * 核心流程：后端每次写成功推 mcp:changed -> 重拉分组与会话（reload 只覆盖列表数据，
+   * 不动当前激活标签）-> 状态栏提示 agent 改了哪一类。纯通知，不打断当前操作；
+   * 卸载时退订。
+   */
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let disposed = false;
+    void listen<McpChanged>("mcp:changed", (event) => {
+      const kind = event.payload.kind;
+      setNotice({ tone: "info", text: `Agent 修改了 ${kind}` });
+      void reload(keyword);
+    })
+      .then((stop) => {
+        if (disposed) stop();
+        else unlisten = stop;
+      })
+      .catch(() => {
+        // 订阅失败只丢这一条通知，列表仍可手动刷新
+      });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
   }, [keyword, reload]);
 
   // 会话被删后关掉对应标签 -> 避免标签指向已不存在的会话

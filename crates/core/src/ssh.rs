@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use crate::error::{CoreError, CoreResult};
 use crate::model::HostKeyInfo;
 use crate::store::Store;
-use crate::terminal::{start_output_pump, OutputSink, TerminalControl};
+use crate::terminal::{start_output_pump, OutputSink, Pump, TerminalControl};
 
 /// 连接超时。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -1161,11 +1161,14 @@ async fn detect_remote_shell(handle: &Arc<client::Handle<ClientHandler>>) -> Rem
 /// 一个运行中的 SSH 终端。
 ///
 /// 无参数
-/// 核心流程：同步侧只持有连接句柄、指令通道与关闭标志，真正的网络 IO 在后台任务里。
+/// 核心流程：同步侧持有连接句柄、指令通道、关闭标志与输出泵句柄，
+/// 真正的网络 IO 在后台任务里。
 pub struct SshSession {
     connection: SshConnection,
     commands: mpsc::UnboundedSender<SshCommand>,
     closed: Arc<AtomicBool>,
+    /// 输出泵句柄：读屏时按游标取历史输出
+    pump: Arc<Pump>,
 }
 
 impl SshSession {
@@ -1233,6 +1236,7 @@ impl SshSession {
                         connection,
                         commands,
                         closed,
+                        pump,
                     });
                 }
             }
@@ -1306,6 +1310,14 @@ impl TerminalControl for SshSession {
     /// 远端指标等功能可以在同一条连接上另开 exec 通道。
     fn connection(&self) -> Option<&SshConnection> {
         Some(&self.connection)
+    }
+
+    /// 从输出泵的回滚缓冲里按游标读一段。
+    ///
+    /// 参数：cursor 为上次返回的 next，max 为本次最多取的字节数
+    /// 核心流程：缓冲与后台读写任务共享，直接按游标读当前位置即可。
+    fn scrollback(&self, cursor: u64, max: usize) -> Option<crate::scrollback::ScrollbackChunk> {
+        Some(self.pump.scrollback().read(cursor, max))
     }
 }
 

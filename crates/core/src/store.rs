@@ -96,6 +96,17 @@ CREATE TABLE IF NOT EXISTS tunnel_config (
 const DDL_TUNNEL_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_tunnel_config_session_id ON tunnel_config(session_id)";
 
+const DDL_MCP_AUDIT: &str = "
+CREATE TABLE IF NOT EXISTS mcp_audit (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          INTEGER NOT NULL,
+    tool        TEXT NOT NULL,
+    args_digest TEXT NOT NULL,
+    ok          INTEGER NOT NULL,
+    error       TEXT,
+    duration_ms INTEGER NOT NULL
+)";
+
 /// 给旧库补列：tunnel_config 早先没有 auto_start。
 const DDL_TUNNEL_ADD_AUTO_START: &str =
     "ALTER TABLE tunnel_config ADD COLUMN auto_start INTEGER NOT NULL DEFAULT 0";
@@ -117,6 +128,12 @@ pub const THEME_NAME_MAX_BYTES: usize = 64;
 
 /// 自定义主题 payload 的字节上限。
 pub const THEME_PAYLOAD_MAX_BYTES: usize = 16384;
+
+/// MCP 审计单次最多返回的行数。
+pub const MCP_AUDIT_MAX_ROWS: usize = 500;
+
+/// MCP 审计未指定条数时的默认值。
+pub const MCP_AUDIT_DEFAULT_ROWS: usize = 100;
 
 /// 会话库，封装全部 SQLite 访问。
 ///
@@ -282,6 +299,7 @@ impl Store {
         sqlx::query(DDL_VAULT_META).execute(&self.pool).await?;
         sqlx::query(DDL_APP_SETTING).execute(&self.pool).await?;
         sqlx::query(DDL_CUSTOM_THEME).execute(&self.pool).await?;
+        sqlx::query(DDL_MCP_AUDIT).execute(&self.pool).await?;
         Ok(())
     }
 
@@ -1183,6 +1201,60 @@ impl Store {
             .await?;
         Ok(())
     }
+
+    /// 写入一条 MCP 工具调用审计。
+    ///
+    /// 参数：entry 为调用摘要，id 由库自增生成，传入值会被忽略
+    /// 核心流程：只落工具名、参数摘要、成败、错误正文与耗时，参数原文不经过这一层；
+    /// 时间戳取 entry.ts，为 0 时用当前毫秒时间补上，旧数据不会出现 1970 年。
+    pub async fn mcp_audit_insert(&self, entry: &McpAuditEntry) -> CoreResult<()> {
+        let ts = if entry.ts > 0 { entry.ts } else { now_ms() };
+        sqlx::query(
+            "INSERT INTO mcp_audit (ts, tool, args_digest, ok, error, duration_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(ts)
+        .bind(&entry.tool)
+        .bind(&entry.args_digest)
+        .bind(if entry.ok { 1i64 } else { 0i64 })
+        .bind(entry.error.as_deref())
+        .bind(entry.duration_ms)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 读取最近的 MCP 工具调用审计。
+    ///
+    /// 参数：limit 为期望条数，0 按默认 100 处理，超过 500 按 500 截断
+    /// 核心流程：按自增主键倒序取最新的若干行，返回顺序即新的在前，
+    /// 前端不必再排一次；ok 列在库里是整数，读出来转回布尔。
+    pub async fn mcp_audit_recent(&self, limit: usize) -> CoreResult<Vec<McpAuditEntry>> {
+        let limit = if limit == 0 {
+            MCP_AUDIT_DEFAULT_ROWS
+        } else {
+            limit.min(MCP_AUDIT_MAX_ROWS)
+        };
+        let rows = sqlx::query(
+            "SELECT id, ts, tool, args_digest, ok, error, duration_ms \
+             FROM mcp_audit ORDER BY id DESC LIMIT ?1",
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|row| McpAuditEntry {
+                id: row.get("id"),
+                ts: row.get("ts"),
+                tool: row.get("tool"),
+                args_digest: row.get("args_digest"),
+                ok: row.get::<i64, _>("ok") != 0,
+                error: row.get("error"),
+                duration_ms: row.get("duration_ms"),
+            })
+            .collect())
+    }
 }
 
 /// 一个用户导入的自定义主题。
@@ -1236,6 +1308,30 @@ pub struct KnownHost {
     pub fingerprint: String,
 }
 
+/// 一条 MCP 工具调用审计。
+///
+/// 无参数
+/// 核心流程：只承载可展示的调用元信息，参数以摘要形式保存，任何原始入参都不在这里；
+/// 按 camelCase 序列化，前端可直接消费。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpAuditEntry {
+    /// 自增主键，同时作为列表里的稳定排序键。
+    pub id: i64,
+    /// 调用发生的毫秒时间戳。
+    pub ts: i64,
+    /// 工具名。
+    pub tool: String,
+    /// 参数摘要，只含键名、数字与字节数。
+    pub args_digest: String,
+    /// 本次调用是否成功。
+    pub ok: bool,
+    /// 失败时的错误正文，成功为空。
+    pub error: Option<String>,
+    /// 调用耗时，单位毫秒。
+    pub duration_ms: i64,
+}
+
 /// 去除首尾空白，空串归一为 None。
 ///
 /// 参数：value 为原始可选字符串
@@ -1264,5 +1360,49 @@ fn derive_copy_name(base: &str, existing: &[String]) -> String {
             return candidate;
         }
         index += 1;
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    /// 审计写入后能按倒序读回，成败、错误正文与摘要原样保留。
+    #[tokio::test]
+    async fn mcp_audit_round_trip_reads_newest_first() {
+        let store = Store::open_in_memory().await.expect("内存库应能打开");
+        let first = McpAuditEntry {
+            id: 0,
+            ts: 1_700_000_000_000,
+            tool: "session_list".to_string(),
+            args_digest: "session_list{}".to_string(),
+            ok: true,
+            error: None,
+            duration_ms: 3,
+        };
+        let second = McpAuditEntry {
+            id: 0,
+            ts: 1_700_000_001_000,
+            tool: "terminal_write".to_string(),
+            args_digest: "terminal_write{data:4B, id:6B}".to_string(),
+            ok: false,
+            error: Some("终端不存在：term-1".to_string()),
+            duration_ms: 7,
+        };
+        store.mcp_audit_insert(&first).await.expect("应能写审计");
+        store.mcp_audit_insert(&second).await.expect("应能写审计");
+
+        let rows = store.mcp_audit_recent(20).await.expect("应能读审计");
+
+        assert_eq!(rows.len(), 2, "两次写入应读回两条");
+        assert_eq!(rows[0].tool, "terminal_write", "最新的应排在最前");
+        assert_eq!(rows[0].args_digest, "terminal_write{data:4B, id:6B}");
+        assert!(!rows[0].ok, "失败调用应读回 false");
+        assert_eq!(rows[0].error.as_deref(), Some("终端不存在：term-1"));
+        assert_eq!(rows[0].duration_ms, 7);
+        assert_eq!(rows[1].tool, "session_list");
+        assert!(rows[1].ok, "成功调用应读回 true");
+        assert!(rows[1].error.is_none(), "成功调用不应带错误正文");
+        assert!(rows[0].id > rows[1].id, "自增主键应保持写入先后");
     }
 }

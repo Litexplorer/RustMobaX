@@ -6,6 +6,7 @@ use std::time::Duration;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
 use crate::error::{CoreError, CoreResult};
+use crate::scrollback::Scrollback;
 
 /// 单次从 PTY 读取的最大字节数。
 const READ_CHUNK: usize = 8192;
@@ -60,6 +61,15 @@ pub trait TerminalControl: Send + Sync {
     fn cwd(&self) -> Option<String> {
         None
     }
+    /// 按游标增量读取历史输出。
+    ///
+    /// 参数：cursor 为上次返回的 next，max 为本次最多取的字节数
+    /// 核心流程：默认返回 None，因为只有挂了输出泵的会话才留有回滚缓冲；
+    /// 上层拿不到就跳过读屏，而不是把它变成一次连接错误。
+    fn scrollback(&self, cursor: u64, max: usize) -> Option<crate::scrollback::ScrollbackChunk> {
+        let _ = (cursor, max);
+        None
+    }
 }
 
 /// 输出泵：读端与交付端之间的缓冲。
@@ -69,6 +79,7 @@ pub trait TerminalControl: Send + Sync {
 /// 用「按时间聚合」换掉「每 8KB 推一次」，避免高频输出把上层队列堆爆。
 pub(crate) struct Pump {
     buffer: Mutex<Vec<u8>>,
+    scrollback: Arc<Scrollback>,
     closed: AtomicBool,
     exit_code: Mutex<Option<Option<i32>>>,
 }
@@ -77,6 +88,7 @@ impl Default for Pump {
     fn default() -> Self {
         Self {
             buffer: Mutex::new(Vec::new()),
+            scrollback: Arc::new(Scrollback::default()),
             closed: AtomicBool::new(false),
             exit_code: Mutex::new(None),
         }
@@ -87,11 +99,22 @@ impl Pump {
     /// 追加新读到的字节。
     ///
     /// 参数：data 为原始字节
-    /// 核心流程：加锁追加；锁被占用时丢弃本轮，后续读取会补上。
+    /// 核心流程：先落一份进回滚缓冲供按游标读取，再加锁追加到本次冲刷的缓冲；
+    /// 冲刷缓冲的锁被占用时丢弃本轮，回滚缓冲仍保有这段数据。
     pub(crate) fn push(&self, data: &[u8]) {
+        self.scrollback.push(data);
         if let Ok(mut guard) = self.buffer.lock() {
             guard.extend_from_slice(data);
         }
+    }
+
+    /// 取回滚缓冲句柄。
+    ///
+    /// 参数：无
+    /// 核心流程：克隆一份 Arc 交给会话持有，读屏与写入共享同一个缓冲，
+    /// 不需要额外的同步通道。
+    pub(crate) fn scrollback(&self) -> Arc<Scrollback> {
+        Arc::clone(&self.scrollback)
     }
 
     /// 取走当前积累的全部字节。
@@ -206,6 +229,8 @@ pub struct TerminalSession {
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     /// 子进程 pid，拿得到才记录 -> 供工作目录查询按 pid 反查
     pid: Option<u32>,
+    /// 输出泵句柄：读屏时按游标取历史输出
+    pump: Arc<Pump>,
 }
 
 impl TerminalSession {
@@ -296,6 +321,7 @@ impl TerminalSession {
             master: Mutex::new(pair.master),
             child,
             pid,
+            pump,
         })
     }
 
@@ -385,6 +411,14 @@ impl TerminalControl for TerminalSession {
     /// 转发工作目录查询。
     fn cwd(&self) -> Option<String> {
         TerminalSession::cwd(self)
+    }
+
+    /// 从输出泵的回滚缓冲里按游标读一段。
+    ///
+    /// 参数：cursor 为上次返回的 next，max 为本次最多取的字节数
+    /// 核心流程：缓冲与读线程共享，直接按游标读当前位置即可，不拷贝整段历史。
+    fn scrollback(&self, cursor: u64, max: usize) -> Option<crate::scrollback::ScrollbackChunk> {
+        Some(self.pump.scrollback().read(cursor, max))
     }
 }
 
@@ -694,6 +728,96 @@ mod tests {
         );
 
         session.kill().expect("关闭应成功");
+    }
+
+    /// 回滚缓冲应按游标增量交付，并与输出泵的累计写入对齐。
+    ///
+    /// 参数：无
+    /// 核心流程：起本地 PTY 跑一条大输出命令，循环用上一次的 next 当游标拉取；
+    /// 收尾时杀进程让写入停止，再断言拼接结果完整、游标与累计写入一致。
+    #[test]
+    fn scrollback_streams_by_cursor() {
+        let (tx, rx) = mpsc::channel();
+        let session = TerminalSession::spawn(
+            &TerminalOptions {
+                shell: Some("/bin/sh".into()),
+                cols: 120,
+                rows: 40,
+                ..Default::default()
+            },
+            Box::new(move |output| {
+                let _ = tx.send(output);
+            }),
+        )
+        .expect("PTY 应能启动");
+
+        // 结束标记用算术展开拼出来 -> 命令行自身的回显里不含这个串，
+        // 只有 seq 真的跑完了才会出现，避免把「回显」误当成「输出到齐」
+        session
+            .write(b"seq 1 20000; echo SCROLL$((7*7))DONE\n")
+            .expect("写入应成功");
+
+        let scrollback = session.pump.scrollback();
+        let mut cursor = 0u64;
+        let mut collected: Vec<u8> = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+
+        while std::time::Instant::now() < deadline {
+            let chunk = TerminalControl::scrollback(&session, cursor, 4096)
+                .expect("本地终端应提供回滚缓冲");
+            assert_eq!(chunk.start, cursor, "每轮的起点应等于上一轮的 next");
+            assert_eq!(
+                chunk.next,
+                chunk.start + chunk.bytes.len() as u64,
+                "next 必须等于 start 加本次字节数"
+            );
+            collected.extend_from_slice(&chunk.bytes);
+            cursor = chunk.next;
+            if collected
+                .windows("SCROLL49DONE".len())
+                .any(|window| window == b"SCROLL49DONE")
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let text = String::from_utf8_lossy(&collected).into_owned();
+        assert!(
+            text.contains("SCROLL49DONE"),
+            "应读到结束标记，实际：{text:?}"
+        );
+        assert!(text.contains("20000"), "末尾数字应完整到达");
+        assert!(text.contains("19999"), "倒数第二行也应完整到达");
+
+        // 杀进程让写入停止 -> 再追平一次，读写双方就落在同一个静态点上
+        session.kill().expect("关闭应成功");
+        std::thread::sleep(Duration::from_millis(200));
+        loop {
+            let chunk = TerminalControl::scrollback(&session, cursor, 4096)
+                .expect("本地终端应提供回滚缓冲");
+            assert_eq!(chunk.start, cursor, "追平时起点仍应连续");
+            let finished = chunk.bytes.is_empty();
+            collected.extend_from_slice(&chunk.bytes);
+            cursor = chunk.next;
+            if finished {
+                break;
+            }
+        }
+
+        let written = scrollback.written();
+        assert_eq!(cursor, written, "游标最终应追平累计写入量");
+        assert_eq!(
+            collected.len() as u64,
+            written,
+            "从 0 开始读到的总字节数应与累计写入一致（未溢出）"
+        );
+        assert!(
+            written > 108_000,
+            "seq 1 20000 应有十万字节以上输出，实际 {written}"
+        );
+
+        drop(rx);
     }
 
     /// 默认参数的 args 必须为空 -> 现有调用点行为不受新增字段影响。

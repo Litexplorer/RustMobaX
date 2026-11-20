@@ -1,9 +1,12 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
   FONT_SIZE_MAX,
   FONT_SIZE_MIN,
   FONT_STACKS,
+  MCP_PORT_DEFAULT,
+  MCP_PORT_MAX,
+  MCP_PORT_MIN,
   SFTP_WIDTH_MAX,
   SFTP_WIDTH_MIN,
   UI_SCALE_MAX,
@@ -15,6 +18,8 @@ import {
   resolveFontStack,
 } from "../api/settings";
 import type { AppSettings, SidebarTab } from "../api/settings";
+import { mcpAudit, mcpResetToken, mcpStatus } from "../api/mcp";
+import type { McpAuditEntry, McpStatus } from "../api/mcp";
 import { systemFonts } from "../api/fonts";
 import type { FontFamily } from "../api/fonts";
 import {
@@ -58,6 +63,32 @@ const TAB_OPTIONS: { id: SidebarTab; label: string }[] = [
   { id: "macros", label: "宏" },
   { id: "sftp", label: "文件" },
 ];
+
+/**
+ * 改完 MCP 设置后等多久再拉状态。
+ *
+ * App 对设置写入做了 300ms 防抖，后端还会联动重启服务；
+ * 这里留出余量，避免读到重启前的旧状态。
+ */
+const MCP_STATUS_REFRESH_DELAY = 500;
+
+/** 监听地址按终端里的写法展示，用等宽字体便于逐字核对端口 */
+const MCP_ADDR_FONT_STACK = 'ui-monospace, "SF Mono", Menlo, Consolas, monospace';
+
+/** 「最近调用」默认展示的条数：一屏能扫完，又足够看出最近在调什么 */
+const MCP_AUDIT_PREVIEW_ROWS = 20;
+
+/**
+ * 把毫秒时间戳格式化成时分秒。
+ *
+ * 参数：ts 为毫秒时间戳
+ * 核心流程：0 表示没有时间信息，显示占位符；其余按本地时区只显示时间，
+ * 审计列表都是最近调用，不需要带日期。
+ */
+function formatAuditTime(ts: number): string {
+  if (!ts) return "-";
+  return new Date(ts).toLocaleTimeString();
+}
 
 /** 导入契约示例：帮助文案里原样展示，照着改就能用 */
 const THEME_JSON_SAMPLE = `{
@@ -364,6 +395,89 @@ export function SettingsDialog({
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
   /** 5 秒没等到选择器返回就提示（xrdp 下 dialog 插件可能挂起） */
   const pickTimer = useRef<number | null>(null);
+  /** MCP 端口输入框的文本：允许中途是空串，失焦时才校验回写 */
+  const [portText, setPortText] = useState(String(settings.mcpPort));
+  /** MCP 服务当前状态：打开弹窗时拉一次，改完设置或重置令牌后再拉 */
+  const [mcpState, setMcpState] = useState<McpStatus | null>(null);
+  /** MCP 操作（重置令牌、读取状态）失败的原因，直接显示在分组里 */
+  const [mcpActionError, setMcpActionError] = useState<string | null>(null);
+  /** 最近的 MCP 调用审计，打开弹窗与点「刷新」时各拉一次 */
+  const [auditRows, setAuditRows] = useState<McpAuditEntry[]>([]);
+  /** 审计读取失败的原因，保留上一次的列表不清空 */
+  const [auditError, setAuditError] = useState<string | null>(null);
+  /** 审计正在拉取，按钮据此禁用避免连点 */
+  const [auditLoading, setAuditLoading] = useState(false);
+  /** 状态请求序号：连续刷新时只认最后一次的结果，迟到的旧结果直接丢掉 */
+  const mcpRefreshSeq = useRef(0);
+  /** 首次渲染由挂载时那次拉取负责，设置变更的监听跳过第一轮 */
+  const mcpSkipFirstChange = useRef(true);
+
+  // 端口被外部改动（恢复默认、重新载入设置）时把输入框同步过来
+  useEffect(() => {
+    setPortText(String(settings.mcpPort));
+  }, [settings.mcpPort]);
+
+  /**
+   * 拉取一次 MCP 服务状态。
+   *
+   * 参数：无
+   * 核心流程：序号自增后发起请求，只有最新一次的结果会写进状态；
+   * 失败时保留上一次的状态，只把原因写进分组错误行，避免一次抖动把整块信息清空。
+   */
+  const refreshMcpStatus = useCallback(async () => {
+    const seq = ++mcpRefreshSeq.current;
+    try {
+      const next = await mcpStatus();
+      if (seq !== mcpRefreshSeq.current) return;
+      setMcpState(next);
+      setMcpActionError(null);
+    } catch (err) {
+      if (seq !== mcpRefreshSeq.current) return;
+      setMcpActionError(`读取 MCP 状态失败：${errorMessage(err)}`);
+    }
+  }, []);
+
+  /**
+   * 拉取最近的 MCP 调用审计。
+   *
+   * 参数：无
+   * 核心流程：成功时整表替换，失败时只写错误行并保留旧列表；
+   * 无论成败都关掉 loading，按钮不会卡在禁用状态。
+   */
+  const refreshMcpAudit = useCallback(async () => {
+    setAuditLoading(true);
+    try {
+      const rows = await mcpAudit(MCP_AUDIT_PREVIEW_ROWS);
+      setAuditRows(rows);
+      setAuditError(null);
+    } catch (err) {
+      setAuditError(`读取调用记录失败：${errorMessage(err)}`);
+    } finally {
+      setAuditLoading(false);
+    }
+  }, []);
+
+  // 打开弹窗时先拉一次：未启用时也能看到端口有没有被别的进程占着
+  useEffect(() => {
+    void refreshMcpStatus();
+  }, [refreshMcpStatus]);
+
+  // 打开弹窗时同时拉一次审计，和状态一起展示
+  useEffect(() => {
+    void refreshMcpAudit();
+  }, [refreshMcpAudit]);
+
+  // 开关或端口改完后等 App 防抖落库、后端重启服务，再拉一次刷新展示
+  useEffect(() => {
+    if (mcpSkipFirstChange.current) {
+      mcpSkipFirstChange.current = false;
+      return undefined;
+    }
+    const timer = window.setTimeout(() => {
+      void refreshMcpStatus();
+    }, MCP_STATUS_REFRESH_DELAY);
+    return () => window.clearTimeout(timer);
+  }, [settings.mcpEnabled, settings.mcpPort, refreshMcpStatus]);
 
   // Esc 关闭：走全局弹窗栈，本弹窗之上若还叠着别的弹窗，Esc 只关最上层；
   // 正在录制快捷键时退出栈，把 Esc 让给录制逻辑（那一下只取消录制，不关弹窗）
@@ -392,6 +506,15 @@ export function SettingsDialog({
   const scalePercent = Math.round(settings.uiScale * 100);
   const systemMode = settings.theme === "system";
 
+  /** 令牌缺失时按空串展示，输入框不会是 undefined 受控告警 */
+  const mcpToken = mcpState?.token ?? "";
+  /** 最近一次启动失败的原因，成功后后端会清空 */
+  const mcpLastError = mcpState?.lastError ?? null;
+  /** 监听地址：后端直接给 host:port；运行中却拿不到地址时用设置里的端口拼一个 */
+  const mcpAddr = mcpState
+    ? mcpState.addr?.trim() || (mcpState.running ? `127.0.0.1:${mcpState.port}` : "")
+    : "";
+
   /**
    * 选中一套主题。
    *
@@ -415,6 +538,58 @@ export function SettingsDialog({
    * 核心流程：夹进 10 ~ 24 的整数，非法值在这里就被挡住。
    */
   const setFontSize = (next: number) => onChange("terminalFontSize", clampFontSize(next));
+
+  /**
+   * 提交 MCP 监听端口。
+   *
+   * 参数：无，读取输入框里的文本
+   * 核心流程：非整数或超出 1024 ~ 65535 时回落到缺省端口并写回设置，
+   * 合法值直接写入；两种情况都把输入框文本同步成最终值，不留下脏输入。
+   */
+  const commitMcpPort = () => {
+    const parsed = Number(portText.trim());
+    const next =
+      Number.isInteger(parsed) && parsed >= MCP_PORT_MIN && parsed <= MCP_PORT_MAX
+        ? parsed
+        : MCP_PORT_DEFAULT;
+    setPortText(String(next));
+    onChange("mcpPort", next);
+  };
+
+  /**
+   * 复制当前 MCP 令牌。
+   *
+   * 参数：token 为要写入剪贴板的令牌
+   * 核心流程：剪贴板不可用或写入被拒时静默忽略，用户可以手动选中输入框里的文本复制。
+   */
+  const copyMcpToken = (token: string) => {
+    const clipboard = navigator.clipboard;
+    if (!token || !clipboard) return;
+    void clipboard.writeText(token).catch(() => {
+      // 静默忽略：复制失败不打断设置流程，也不弹额外提示
+    });
+  };
+
+  /**
+   * 重置 MCP 令牌。
+   *
+   * 参数：无
+   * 核心流程：先二次确认（已连接的客户端会失效）-> 调后端生成新令牌并重启服务 ->
+   * 成功后重拉状态把新令牌显示出来；失败把中文原因写进分组错误行。
+   */
+  const resetMcpToken = async () => {
+    const confirmed = window.confirm(
+      "重置后已连接的 MCP 客户端需要重新配置令牌，确定要重置吗？",
+    );
+    if (!confirmed) return;
+    setMcpActionError(null);
+    try {
+      await mcpResetToken();
+      await refreshMcpStatus();
+    } catch (err) {
+      setMcpActionError(`重置令牌失败：${errorMessage(err)}`);
+    }
+  };
 
   /**
    * 切换「跟随系统」。
@@ -846,6 +1021,207 @@ export function SettingsDialog({
             </div>
             <p className="setting-note">
               也可以直接拖动侧栏右边缘调整，允许 260 到 520 px；窄于 360 px 时文件分页会自动切成紧凑行。
+            </p>
+          </section>
+
+          <section className="settings-group">
+            <h3>MCP 服务</h3>
+
+            <div className="setting-row">
+              <label className="setting-label" htmlFor="settings-mcp-enabled">
+                启用 MCP 服务
+              </label>
+              <label className="check-line">
+                <input
+                  id="settings-mcp-enabled"
+                  className="inline-check"
+                  type="checkbox"
+                  checked={settings.mcpEnabled}
+                  onChange={(event) => onChange("mcpEnabled", event.target.checked)}
+                />
+                <span>允许本机客户端通过 MCP 协议调用终端与会话能力</span>
+              </label>
+            </div>
+
+            <div className="setting-row">
+              <label className="setting-label" htmlFor="settings-mcp-port">
+                监听端口
+              </label>
+              <input
+                id="settings-mcp-port"
+                className="input-narrow"
+                type="number"
+                min={MCP_PORT_MIN}
+                max={MCP_PORT_MAX}
+                step={1}
+                value={portText}
+                disabled={!settings.mcpEnabled}
+                onChange={(event) => setPortText(event.target.value)}
+                onBlur={commitMcpPort}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") commitMcpPort();
+                }}
+                aria-describedby="settings-mcp-hint"
+              />
+            </div>
+            <div className="setting-row">
+              <span className="setting-label">运行状态</span>
+              <div>
+                <span className="tunnel-status">
+                  <span
+                    className={`tunnel-dot ${mcpState?.running ? "is-running" : ""}`}
+                    aria-hidden="true"
+                  />
+                  <span>{mcpState?.running ? "运行中" : "未运行"}</span>
+                  {mcpAddr && (
+                    <span style={{ fontFamily: MCP_ADDR_FONT_STACK }} title={mcpAddr}>
+                      {mcpAddr}
+                    </span>
+                  )}
+                </span>
+                {mcpLastError && (
+                  <p className="form-error" role="alert">
+                    服务启动失败：{mcpLastError}
+                  </p>
+                )}
+              </div>
+            </div>
+
+            <div className="setting-row">
+              <label className="setting-label" htmlFor="settings-mcp-token">
+                访问令牌
+              </label>
+              <div className="path-row">
+                <input
+                  id="settings-mcp-token"
+                  type="text"
+                  readOnly
+                  spellCheck={false}
+                  autoComplete="off"
+                  value={mcpToken}
+                  placeholder="尚未生成"
+                  disabled={!settings.mcpEnabled}
+                  aria-label="MCP 访问令牌"
+                />
+                <button
+                  type="button"
+                  disabled={!settings.mcpEnabled}
+                  onClick={() => copyMcpToken(mcpToken)}
+                >
+                  复制
+                </button>
+                <button
+                  type="button"
+                  disabled={!settings.mcpEnabled}
+                  onClick={() => void resetMcpToken()}
+                >
+                  重置令牌
+                </button>
+              </div>
+            </div>
+
+            <div className="setting-row">
+              <span className="setting-label">最近调用</span>
+              <div style={{ width: "100%" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span className="setting-note">参数只保留键名与字节数，不含原文</span>
+                  <button
+                    type="button"
+                    onClick={() => void refreshMcpAudit()}
+                    disabled={auditLoading}
+                  >
+                    {auditLoading ? "刷新中" : "刷新"}
+                  </button>
+                </div>
+                {auditError && (
+                  <p className="form-error" role="alert">
+                    {auditError}
+                  </p>
+                )}
+                {auditRows.length === 0 ? (
+                  <p className="setting-note">暂无调用记录</p>
+                ) : (
+                  <div
+                    style={{
+                      display: "grid",
+                      gap: 2,
+                      marginTop: 6,
+                      fontFamily: MCP_ADDR_FONT_STACK,
+                      fontSize: "calc(11px * var(--ui-scale))",
+                    }}
+                  >
+                    <div
+                      style={{
+                        display: "grid",
+                        gridTemplateColumns: "78px 128px minmax(0, 1fr) 58px 48px",
+                        gap: 8,
+                        color: "var(--text-dim)",
+                      }}
+                    >
+                      <span>时间</span>
+                      <span>工具</span>
+                      <span>参数摘要</span>
+                      <span>耗时</span>
+                      <span>结果</span>
+                    </div>
+                    {auditRows.map((row) => (
+                      <div
+                        key={row.id}
+                        className={row.ok ? undefined : "form-error"}
+                        title={!row.ok && row.error ? row.error : undefined}
+                        style={{
+                          display: "grid",
+                          gridTemplateColumns: "78px 128px minmax(0, 1fr) 58px 48px",
+                          gap: 8,
+                          margin: 0,
+                          whiteSpace: "nowrap",
+                        }}
+                      >
+                        <span style={{ color: "var(--text-dim)" }}>
+                          {formatAuditTime(row.ts)}
+                        </span>
+                        <span
+                          style={{ overflow: "hidden", textOverflow: "ellipsis" }}
+                          title={row.tool}
+                        >
+                          {row.tool}
+                        </span>
+                        <span
+                          style={{ overflow: "hidden", textOverflow: "ellipsis" }}
+                          title={row.argsDigest}
+                        >
+                          {row.argsDigest}
+                        </span>
+                        <span style={{ color: "var(--text-dim)" }}>{row.durationMs} ms</span>
+                        <span style={row.ok ? { color: "var(--text-dim)" } : undefined}>
+                          {row.ok ? "成功" : "失败"}
+                        </span>
+                        {!row.ok && row.error && (
+                          <span
+                            style={{
+                              gridColumn: "1 / -1",
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              opacity: 0.85,
+                            }}
+                          >
+                            {row.error}
+                          </span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {mcpActionError && (
+              <p className="form-error" role="alert">
+                {mcpActionError}
+              </p>
+            )}
+            <p className="setting-note" id="settings-mcp-hint">
+              仅监听本机回环地址，客户端需带 Bearer 令牌；重置后已连接的 MCP 客户端需要重新配置令牌
             </p>
           </section>
 

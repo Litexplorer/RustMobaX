@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { errorDetail, errorKind, errorMessage } from "../api/session";
 import type { Session } from "../api/session";
 import type { HostKeyInfo } from "../api/terminal";
@@ -13,6 +13,7 @@ import {
 import type { TunnelConfig, TunnelInfo, TunnelKindName } from "../api/tunnel";
 import { useEscapeClose } from "../lib/useEscapeClose";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { IconSearch } from "./icons";
 
 type Props = {
   /** 可作为隧道源的会话，父层已过滤成 ssh / sftp（新建 / 编辑表单要用） */
@@ -46,6 +47,8 @@ type Props = {
 type Row = {
   id: string;
   name: string;
+  /** 来源会话名；配置里的会话已被删除时用固定文案，孤儿行没有来源配置则留空 */
+  sessionName: string;
   kind: TunnelKindName;
   running: boolean;
   listenHost: string;
@@ -71,6 +74,12 @@ type Banner = { tone: "info" | "error"; text: string };
 
 /** 用户在指纹弹窗里取消（或信任失败）时的固定提示文案。 */
 const HOST_KEY_CANCELLED = "已取消，未信任主机指纹";
+
+/** 配置指向的会话已经不存在时的固定文案（与新建 / 编辑表单里的占位选项一致）。 */
+const SESSION_DELETED = "（会话已删除）";
+
+/** 分页条可选的每页条数。 */
+const PAGE_SIZES = [10, 20, 50];
 
 /** 一次启动的结果：成功带回运行态，失败只带一句可直接展示的文案。 */
 type StartOutcome = { ok: true; info: TunnelInfo } | { ok: false; message: string };
@@ -135,11 +144,15 @@ function addressText(host: string, port: number, emptyPort: string): string {
 /**
  * 按 id 合并配置与运行态。
  *
- * 参数：configs 为库里的配置，runtime 为当前运行态
+ * 参数：configs 为库里的配置，runtime 为当前运行态，sessionNames 为会话 id 到名称的映射
  * 核心流程：先按配置顺序出行（并吸收运行态里的实际端口），再把运行态里多出来的
  * 孤儿项追加在后面，这样配置已删除但还在跑的隧道不会凭空消失。
  */
-function mergeRows(configs: TunnelConfig[], runtime: TunnelInfo[]): Row[] {
+function mergeRows(
+  configs: TunnelConfig[],
+  runtime: TunnelInfo[],
+  sessionNames: Map<string, string>,
+): Row[] {
   const live = new Map(runtime.map((item) => [item.id, item]));
   const rows: Row[] = [];
   const seen = new Set<string>();
@@ -150,6 +163,7 @@ function mergeRows(configs: TunnelConfig[], runtime: TunnelInfo[]): Row[] {
     rows.push({
       id: config.id,
       name: (run?.name || config.name || "").trim(),
+      sessionName: sessionNames.get(config.sessionId) ?? SESSION_DELETED,
       kind: config.kind,
       running: run?.running === true,
       listenHost: run?.listenHost || config.listenHost,
@@ -166,6 +180,8 @@ function mergeRows(configs: TunnelConfig[], runtime: TunnelInfo[]): Row[] {
     rows.push({
       id: run.id,
       name: run.name.trim() === "" ? "(已删除配置)" : run.name,
+      // 孤儿行只剩运行态，拿不到来源会话，留空即不参与按会话名的匹配
+      sessionName: "",
       kind: run.kind,
       running: run.running,
       listenHost: run.listenHost,
@@ -180,6 +196,28 @@ function mergeRows(configs: TunnelConfig[], runtime: TunnelInfo[]): Row[] {
 }
 
 /**
+ * 判断一行是否命中搜索关键字。
+ *
+ * 参数：row 为合并后的行，keyword 为用户输入
+ * 核心流程：关键字去掉首尾空白并转小写后做包含匹配，覆盖名称、来源会话、类型
+ * （英文 local / remote / dynamic 与中文标签同时认）、监听与目标地址端口；
+ * 关键字为空白时全部命中，清空搜索即恢复完整列表。
+ */
+function matchRow(row: Row, keyword: string): boolean {
+  const needle = keyword.trim().toLowerCase();
+  if (needle === "") return true;
+  const fields = [
+    row.name,
+    row.sessionName,
+    row.kind,
+    kindLabel(row.kind),
+    `${row.listenHost}:${row.listenPort}`,
+    `${row.targetHost}:${row.targetPort}`,
+  ];
+  return fields.some((field) => field.toLowerCase().includes(needle));
+}
+
+/**
  * 端口转发（隧道）列表弹窗。
  *
  * 参数：见 Props
@@ -188,8 +226,15 @@ function mergeRows(configs: TunnelConfig[], runtime: TunnelInfo[]): Row[] {
  * 所有失败原因都用单行提示条就地显示，不弹原生 alert。
  */
 export function TunnelDialog(props: Props) {
-  const { revision, onOpenForm, onNotify, onClose, onConfirmHostKey, needsVaultBeforeStart } =
-    props;
+  const {
+    revision,
+    sessions,
+    onOpenForm,
+    onNotify,
+    onClose,
+    onConfirmHostKey,
+    needsVaultBeforeStart,
+  } = props;
 
   // Esc = 关闭列表；叠在它上面的表单 / 删除确认会自己入栈成为栈顶，
   // 所以连按 Esc 是「先关上层，再关列表」
@@ -202,8 +247,27 @@ export function TunnelDialog(props: Props) {
   const [banner, setBanner] = useState<Banner | null>(null);
   /** 待确认删除的行，非空时叠加 ConfirmDialog */
   const [confirming, setConfirming] = useState<Row | null>(null);
+  /** 搜索关键字：纯前端过滤，不发任何请求 */
+  const [keyword, setKeyword] = useState("");
+  /** 当前页码：从 1 起；数据变少时由 current 夹取，不会渲染成空页 */
+  const [page, setPage] = useState(1);
+  /** 每页条数：纯前端分片，可选 10 / 20 / 50 */
+  const [pageSize, setPageSize] = useState(20);
   /** 有任何一行在启停中：禁用批量按钮，避免叠着操作 */
   const busy = Object.keys(pending).length > 0;
+
+  /**
+   * 会话 id -> 名称：列表要显示每条隧道的来源会话，也支持按会话名搜索。
+   *
+   * 父层每次渲染都用 filter 重建 sessions 数组，引用每次都变；所以用「id + 名称」
+   * 拼出的内容签名做依赖，内容没变就复用同一个 Map，load 的依赖也就不会变，
+   * 避免父层其它状态刷新（例如指标轮询）把隧道列表跟着重拉一遍。
+   */
+  const sessionSignature = sessions.map((item) => `${item.id}\u0000${item.name}`).join("\u0001");
+  const sessionNames = useMemo(
+    () => new Map(sessions.map((item) => [item.id, item.name])),
+    [sessionSignature],
+  );
 
   /**
    * 全量刷新：配置 + 运行态。
@@ -223,7 +287,7 @@ export function TunnelDialog(props: Props) {
       } catch (err) {
         runtimeError = errorMessage(err);
       }
-      setRows(mergeRows(configs, runtime));
+      setRows(mergeRows(configs, runtime, sessionNames));
       setBanner(
         runtimeError ? { tone: "error", text: `运行状态读取失败：${runtimeError}` } : null,
       );
@@ -232,7 +296,7 @@ export function TunnelDialog(props: Props) {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [sessionNames]);
 
   useEffect(() => {
     void load();
@@ -473,6 +537,32 @@ export function TunnelDialog(props: Props) {
   };
 
   const runningCount = rows.filter((row) => row.running).length;
+  /** 关键字过滤后的行：关键字为空白时与 rows 完全一致 */
+  const filtered = rows.filter((row) => matchRow(row, keyword));
+  /** 条数文案：有关键字时给出匹配数，工具栏与分页条共用这一套口径 */
+  const totalText =
+    keyword.trim() === ""
+      ? `共 ${rows.length} 条`
+      : `匹配 ${filtered.length} / ${rows.length} 条`;
+  /** 工具栏计数：在条数后面补上运行中条数 */
+  const countText = `${totalText} · 运行中 ${runningCount} 条`;
+  /** 总页数：至少 1 页，让只有一页时分页控件也照常显示 */
+  const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize));
+  /** 夹取后的当前页：删行或加过滤条件后数据变少，不会停在越界页码上 */
+  const current = Math.min(page, pageCount);
+  /** 当前页要渲染的行 */
+  const pageRows = filtered.slice((current - 1) * pageSize, current * pageSize);
+
+  // 让 page 跟随夹取结果收敛：数据变少时把旧页码写回，避免数据回升后跳回旧页。
+  // 本 effect 必须排在下面的「回到第 1 页」之前：改关键字时两者会同批更新，后者生效才落到第 1 页。
+  useEffect(() => {
+    if (page !== current) setPage(current);
+  }, [page, current]);
+
+  // 关键字或每页条数变了就回到第 1 页：只依赖这两项，不会每次渲染都触发
+  useEffect(() => {
+    setPage(1);
+  }, [keyword, pageSize]);
 
   return (
     <>
@@ -488,8 +578,19 @@ export function TunnelDialog(props: Props) {
           <div className="dialog-body tunnel-body">
             <div className="tunnel-toolbar">
               <span className="tunnel-toolbar-count">
-                {loading ? "读取中…" : `共 ${rows.length} 条 · 运行中 ${runningCount} 条`}
+                {loading ? "读取中…" : countText}
               </span>
+              <div className="tree-search tunnel-search">
+                <span className="tree-search-icon">
+                  <IconSearch size={13} />
+                </span>
+                <input
+                  value={keyword}
+                  placeholder="搜索名称 / 会话 / 监听 / 目标"
+                  aria-label="搜索隧道"
+                  onChange={(event) => setKeyword(event.target.value)}
+                />
+              </div>
               <div className="tunnel-toolbar-actions">
                 <button
                   type="button"
@@ -522,7 +623,13 @@ export function TunnelDialog(props: Props) {
                   </button>
                 )}
               </div>
+            ) : filtered.length === 0 ? (
+              <div className="tunnel-empty">
+                <p>没有匹配「{keyword.trim()}」的隧道</p>
+              </div>
             ) : (
+              // 表格与分页条是兄弟节点，用一个片段包起来
+              <>
               <div className="tunnel-table-scroll">
               <table className="tunnel-table">
                 <thead>
@@ -536,7 +643,7 @@ export function TunnelDialog(props: Props) {
                   </tr>
                 </thead>
                 <tbody>
-                  {rows.map((row) => {
+                  {pageRows.map((row) => {
                     const pendingAction = pending[row.id] ?? null;
                     const stateText =
                       pendingAction === "start"
@@ -647,6 +754,44 @@ export function TunnelDialog(props: Props) {
                 </tbody>
               </table>
               </div>
+              <div className="tunnel-pager">
+                <span className="tunnel-pager-count">{totalText}</span>
+                <span className="tunnel-pager-page">
+                  第 {current} / {pageCount} 页
+                </span>
+                <label className="tunnel-pager-size">
+                  每页
+                  <select
+                    value={pageSize}
+                    aria-label="每页条数"
+                    onChange={(event) => setPageSize(Number(event.target.value))}
+                  >
+                    {PAGE_SIZES.map((size) => (
+                      <option key={size} value={size}>
+                        {size}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                {/* 两个翻页按钮复用表格行内小按钮的尺寸与配色，不另造一套样式 */}
+                <div className="tunnel-row-actions">
+                  <button
+                    type="button"
+                    disabled={current <= 1}
+                    onClick={() => setPage(current - 1)}
+                  >
+                    上一页
+                  </button>
+                  <button
+                    type="button"
+                    disabled={current >= pageCount}
+                    onClick={() => setPage(current + 1)}
+                  >
+                    下一页
+                  </button>
+                </div>
+              </div>
+              </>
             )}
           </div>
 
