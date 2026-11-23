@@ -820,6 +820,57 @@ impl SshConnection {
         }
     }
 
+    /// 用私钥完成认证，RSA 按候选签名算法依次尝试。
+    ///
+    /// 参数：session 为握手完成、等待认证的连接，username 为登录用户名，
+    /// key 为已加载的私钥
+    /// 核心流程：RSA 的签名算法不由密钥本身决定，现代 sshd 普遍禁用了 SHA1 的
+    /// `ssh-rsa`，只认 `rsa-sha2-256` / `rsa-sha2-512`，所以候选顺序取
+    /// SHA256 -> SHA512 -> SHA1，前一个被拒才降级到下一个；
+    /// 其余密钥类型（ed25519、ecdsa 等）的算法由密钥自身定死，只有 None 一个候选。
+    /// 每个候选都走一次完整的公钥认证：成功立即返回；被拒或出错就试下一个，
+    /// 全部失败后把「试过哪些算法」与最后一次的错误一起交给调用方。
+    async fn authenticate_private_key(
+        session: &mut client::Handle<ClientHandler>,
+        username: &str,
+        key: &Arc<PrivateKey>,
+    ) -> CoreResult<()> {
+        let is_rsa = matches!(key.key_data(), KeypairData::Rsa(_));
+        let candidates: &[Option<HashAlg>] = if is_rsa {
+            &[Some(HashAlg::Sha256), Some(HashAlg::Sha512), None]
+        } else {
+            &[None]
+        };
+
+        let mut last_error: Option<String> = None;
+        for hash in candidates {
+            let offered = PrivateKeyWithHashAlg::new(Arc::clone(key), *hash);
+            match session.authenticate_publickey(username, offered).await {
+                Ok(AuthResult::Success) => return Ok(()),
+                // 服务端拒了这个签名算法或这把钥匙 -> 换下一个候选再试
+                Ok(AuthResult::Failure { .. }) => {}
+                // 传输层出错（对端断开等）也按「这个候选不行」处理，最后统一报错
+                Err(err) => last_error = Some(err.to_string()),
+            }
+        }
+
+        // 非 RSA 只有一种算法，保持原来的文案
+        if !is_rsa {
+            return Err(CoreError::Ssh("认证失败：私钥不被该主机接受".into()));
+        }
+        let tried = candidates
+            .iter()
+            .map(|hash| match hash {
+                Some(HashAlg::Sha256) => "rsa-sha2-256",
+                Some(HashAlg::Sha512) => "rsa-sha2-512",
+                _ => "ssh-rsa",
+            })
+            .collect::<Vec<_>>()
+            .join(" / ");
+        let detail = last_error.unwrap_or_else(|| "服务端拒绝了该密钥".into());
+        Err(CoreError::Ssh(format!("私钥认证失败（已尝试 {tried}）：{detail}")))
+    }
+
     /// 在任意双向字节流上完成握手与认证。
     ///
     /// 参数：store 为已知主机库，options 为连接参数，
@@ -888,33 +939,22 @@ impl SshConnection {
         };
 
         // 认证 -> 失败要能区分"密码错"、私钥不被接受、私钥读取失败
-        let (authenticated, failure_hint) = match &options.auth {
-            SshAuth::Password(password) => (
-                session
-                    .authenticate_password(&options.username, password)
-                    .await
-                    .map_err(|err| CoreError::Ssh(format!("认证异常：{err}")))?,
-                "认证失败：用户名或密码错误",
-            ),
+        let authenticated = match &options.auth {
+            SshAuth::Password(password) => session
+                .authenticate_password(&options.username, password)
+                .await
+                .map_err(|err| CoreError::Ssh(format!("认证异常：{err}")))?,
             SshAuth::PrivateKey { path, .. } => {
                 // 私钥已在上面按同一分支加载 -> 这里取同一份 Arc，认证完也不会被 drop
-                let key = match agent_key.as_ref() {
-                    Some(key) => PrivateKeyWithHashAlg::new(Arc::clone(key), None),
-                    None => {
-                        return Err(CoreError::Ssh(format!("读取私钥失败（{path}）：私钥未加载")));
-                    }
+                let Some(key) = agent_key.as_ref() else {
+                    return Err(CoreError::Ssh(format!("读取私钥失败（{path}）：私钥未加载")));
                 };
-                (
-                    session
-                        .authenticate_publickey(&options.username, key)
-                        .await
-                        .map_err(|err| CoreError::Ssh(format!("认证异常：{err}")))?,
-                    "认证失败：私钥不被该主机接受",
-                )
+                Self::authenticate_private_key(&mut session, &options.username, key).await?;
+                AuthResult::Success
             }
         };
         if !matches!(authenticated, AuthResult::Success) {
-            return Err(CoreError::Ssh(failure_hint.to_string()));
+            return Err(CoreError::Ssh("认证失败：用户名或密码错误".into()));
         }
 
         Ok(session)
@@ -1810,6 +1850,8 @@ mod tests {
         open_agent_channel: bool,
         /// agent 通道上的观察结果，各连接共享一份。
         agent_probe: Arc<Mutex<AgentProbe>>,
+        /// 客户端在公钥认证请求里声明的签名算法名，各连接共享一份。
+        auth_algs: Arc<Mutex<Vec<String>>>,
     }
 
     struct EchoHandler {
@@ -1836,6 +1878,8 @@ mod tests {
         agent_channel: Option<ChannelId>,
         /// agent 通道上的观察结果。
         agent_probe: Arc<Mutex<AgentProbe>>,
+        /// 客户端在公钥认证请求里声明的签名算法名（追加记账）。
+        auth_algs: Arc<Mutex<Vec<String>>>,
     }
 
     impl EchoHandler {
@@ -1949,8 +1993,12 @@ mod tests {
         async fn auth_publickey(
             &mut self,
             _user: &str,
-            _key: russh::server::VerifiedPublicKey<'_>,
+            key: russh::server::VerifiedPublicKey<'_>,
         ) -> Result<Auth, Self::Error> {
+            // 记下请求里声明的算法名 -> 用例据此确认客户端没有退回 SHA1 的 ssh-rsa
+            if let Ok(mut log) = self.auth_algs.lock() {
+                log.push(key.algorithm.to_string());
+            }
             Ok(Auth::Accept)
         }
 
@@ -2158,6 +2206,7 @@ mod tests {
                 open_agent_channel: self.open_agent_channel,
                 agent_channel: None,
                 agent_probe: Arc::clone(&self.agent_probe),
+                auth_algs: Arc::clone(&self.auth_algs),
             }
         }
     }
@@ -2266,7 +2315,7 @@ mod tests {
         prompt: bool,
         first_session_only: bool,
     ) -> (u16, Arc<Mutex<Vec<u8>>>, Arc<Mutex<Vec<u32>>>) {
-        let (port, received, agent_requests, _probe) =
+        let (port, received, agent_requests, _probe, _auth_algs) =
             spawn_server_inner(banner, exec_mode, prompt, first_session_only, false).await;
         (port, received, agent_requests)
     }
@@ -2278,9 +2327,20 @@ mod tests {
     /// `open_agent_channel`；返回端口与 agent 通道上的观察结果，
     /// 用例据此断言客户端应答器的身份列表与签名。
     async fn spawn_agent_probe_server() -> (u16, Arc<Mutex<AgentProbe>>) {
-        let (port, _received, _agent_requests, probe) =
+        let (port, _received, _agent_requests, probe, _auth_algs) =
             spawn_server_inner("WELCOME", ExecMode::Fixed("bash"), true, false, true).await;
         (port, probe)
+    }
+
+    /// 起一台会记账「客户端声明的公钥签名算法」的服务端。
+    ///
+    /// 参数：无
+    /// 核心流程：用默认 banner 与 exec 回显启动，只额外把认证请求里的算法名
+    /// 收集起来交回 -> 用例据此断言 RSA 认证没有退回 SHA1 的 ssh-rsa。
+    async fn spawn_auth_alg_server() -> (u16, Arc<Mutex<Vec<String>>>) {
+        let (port, _received, _agent_requests, _probe, auth_algs) =
+            spawn_server_inner("WELCOME", ExecMode::Echo, false, false, false).await;
+        (port, auth_algs)
     }
 
     /// 底层启动函数：绑端口、生成主机密钥、后台跑 russh server。
@@ -2291,7 +2351,8 @@ mod tests {
     /// open_agent_channel 为是否像堡垒机那样反开 agent 通道
     /// 核心流程：绑 127.0.0.1:0 拿随机端口 → 后台跑 russh server →
     /// 返回端口、服务端收到的字节（用于反推客户端到底写了什么）、
-    /// agent 转发申请记录（用于断言堡垒机准入请求发没发）与 agent 通道观察结果。
+    /// agent 转发申请记录（用于断言堡垒机准入请求发没发）、agent 通道观察结果
+    /// 与客户端声明的公钥签名算法名。
     async fn spawn_server_inner(
         banner: &'static str,
         exec_mode: ExecMode,
@@ -2303,6 +2364,7 @@ mod tests {
         Arc<Mutex<Vec<u8>>>,
         Arc<Mutex<Vec<u32>>>,
         Arc<Mutex<AgentProbe>>,
+        Arc<Mutex<Vec<String>>>,
     ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("应能绑定端口");
         let port = listener.local_addr().expect("应能取到本地地址").port();
@@ -2324,6 +2386,8 @@ mod tests {
         let agent_requests_for_server = Arc::clone(&agent_requests);
         let agent_probe: Arc<Mutex<AgentProbe>> = Arc::new(Mutex::new(AgentProbe::default()));
         let agent_probe_for_server = Arc::clone(&agent_probe);
+        let auth_algs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let auth_algs_for_server = Arc::clone(&auth_algs);
         tokio::spawn(async move {
             let mut server = EchoServer {
                 banner,
@@ -2335,11 +2399,12 @@ mod tests {
                 agent_requests: agent_requests_for_server,
                 open_agent_channel,
                 agent_probe: agent_probe_for_server,
+                auth_algs: auth_algs_for_server,
             };
             let _ = server.run_on_socket(config, &listener).await;
         });
 
-        (port, received, agent_requests, agent_probe)
+        (port, received, agent_requests, agent_probe, auth_algs)
     }
 
     #[test]
@@ -2619,6 +2684,31 @@ mod tests {
         (path, dir, public)
     }
 
+    /// 生成一对 RSA 测试密钥并写到临时目录。
+    ///
+    /// 参数：无
+    /// 核心流程：RSA 的签名算法要在认证时按候选依次协商，所以单独造一把 RSA 私钥 ->
+    /// 导出 OpenSSH 私钥写进与 Ed25519 用例不同的临时目录 -> 返回 (私钥路径, 临时目录)。
+    fn write_temp_rsa_key() -> (std::path::PathBuf, std::path::PathBuf) {
+        let key = russh::keys::PrivateKey::random(
+            &mut rand::rng(),
+            russh::keys::Algorithm::Rsa { hash: None },
+        )
+        .expect("应能生成 RSA 密钥");
+        let dir = std::env::temp_dir().join(format!(
+            "rmx-rsa-key-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        std::fs::create_dir_all(&dir).expect("应能建临时目录");
+        let path = dir.join("id_rsa");
+        let pem = key
+            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .expect("应能导出 OpenSSH 私钥");
+        std::fs::write(&path, pem.as_bytes()).expect("应能写私钥文件");
+        (path, dir)
+    }
+
     /// 等 agent 通道上「身份列表 + 签名」两样东西都到齐。
     ///
     /// 参数：probe 为服务端在 agent 通道上的观察结果
@@ -2714,6 +2804,47 @@ mod tests {
         let session = SshSession::connect(&store, &options, Box::new(|_| {}))
             .expect("私钥认证应能连上");
         session.close().expect("关闭应成功");
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// RSA 私钥认证必须用 SHA2 签名，不能退回 SHA1 的 ssh-rsa。
+    ///
+    /// 参数：无
+    /// 核心流程：起一台记录「客户端声明的公钥签名算法」的服务端 ->
+    /// 用临时生成的 RSA 私钥认证 -> 断言握手成功，且请求里声明的算法是
+    /// rsa-sha2-256（现代 sshd 普遍禁用了 ssh-rsa，退回 SHA1 会直接被拒）。
+    #[test]
+    fn rsa_auth_prefers_sha2_signature() {
+        let store = runtime().block_on(async { Store::open_in_memory().await }).expect("内存库");
+        let (port, auth_algs) = runtime().block_on(spawn_auth_alg_server());
+        let (key_path, dir) = write_temp_rsa_key();
+
+        let options = SshOptions {
+            auth: SshAuth::PrivateKey {
+                path: key_path.to_string_lossy().to_string(),
+                passphrase: None,
+            },
+            ..echo_options(port, true)
+        };
+        let session = SshSession::connect(&store, &options, Box::new(|_| {}))
+            .expect("RSA 私钥认证应能连上");
+        session.close().expect("关闭应成功");
+
+        let algs = auth_algs
+            .lock()
+            .map(|log| log.clone())
+            .unwrap_or_default();
+        assert!(!algs.is_empty(), "服务端应收到至少一次公钥认证请求");
+        assert_eq!(
+            algs.first().map(String::as_str),
+            Some("rsa-sha2-256"),
+            "首次认证应选 rsa-sha2-256，实际：{algs:?}"
+        );
+        assert!(
+            algs.iter().all(|alg| alg != "ssh-rsa"),
+            "不应退回 SHA1 的 ssh-rsa，实际：{algs:?}"
+        );
 
         std::fs::remove_dir_all(dir).ok();
     }
