@@ -96,6 +96,8 @@ pub async fn sftp_connect(
         term: "xterm-256color".to_string(),
         accept_unknown_host_key: request.accept_unknown_host_key,
         jump,
+        // SFTP 只开子系统通道，没有交互 shell，不需要 agent 转发
+        agent_forward: false,
     };
 
     let store = state.store.clone();

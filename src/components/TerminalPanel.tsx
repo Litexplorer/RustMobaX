@@ -265,6 +265,8 @@ const TERMINAL_LAUNCHERS: Partial<Record<Protocol, TerminalLauncher>> = {
         cols,
         rows,
         acceptUnknownHostKey,
+        // Agent 转发缺省开启 -> 只有 extra 里显式写了 false 才关闭
+        agentForward: sessionExtraObject(session).agentForwarding !== false,
       },
       onEvent,
     ),

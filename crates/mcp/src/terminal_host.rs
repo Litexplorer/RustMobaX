@@ -108,6 +108,8 @@ fn ssh_options(spec: SshSpec) -> CoreResult<SshOptions> {
         term,
         accept_unknown_host_key: spec.accept_unknown_host_key,
         jump: None,
+        // 工具层没提这个开关时按开启处理，堡垒机准入才不会被静默跳过
+        agent_forward: spec.agent_forward.unwrap_or(true),
     })
 }
 

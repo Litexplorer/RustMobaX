@@ -1483,6 +1483,7 @@ mod tests {
             rows: 24,
             term: "xterm-256color".into(),
             accept_unknown_host_key: true,
+            agent_forward: false,
             jump: None,
         }
     }

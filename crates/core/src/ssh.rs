@@ -4,9 +4,13 @@ use std::time::Duration;
 
 use russh::client;
 use russh::client::AuthResult;
-use russh::keys::PrivateKeyWithHashAlg;
+use russh::keys::signature::Signer;
+use russh::keys::ssh_encoding::Encode;
+use russh::keys::ssh_key::private::KeypairData;
+use russh::keys::ssh_key::Signature;
+use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKey};
 use russh::{ChannelMsg, Disconnect};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
@@ -163,6 +167,11 @@ pub struct SshOptions {
     pub accept_unknown_host_key: bool,
     /// 跳板机配置（None 表示直连目标）；跳板机自身不能再配跳板。
     pub jump: Option<Box<SshOptions>>,
+    /// 是否在交互 shell 通道上申请 agent 转发（`auth-agent-req@openssh.com`）。
+    ///
+    /// 企业堡垒机常把「客户端必须申请 agent 转发」当成准入条件，
+    /// 所以主会话默认开着；跳板机只开 direct-tcpip、没有 session 通道，恒为 false。
+    pub agent_forward: bool,
 }
 
 impl SshOptions {
@@ -217,6 +226,10 @@ struct ClientHandler {
     probe: Arc<Mutex<HostKeyProbe>>,
     /// 远程转发专用信箱；None 表示这条连接不接收 forwarded-tcpip 通道。
     forward: Option<mpsc::UnboundedSender<ForwardedChannel>>,
+    /// 私钥认证用的同一份私钥；堡垒机反开 agent 通道时用它回身份与签名。
+    ///
+    /// None 表示这次认证没用私钥（密码认证），agent 通道只回空身份列表。
+    agent_key: Option<Arc<PrivateKey>>,
 }
 
 impl client::Handler for ClientHandler {
@@ -307,6 +320,26 @@ impl client::Handler for ClientHandler {
         });
         Ok(())
     }
+
+    /// 服务端（堡垒机）反开 `auth-agent@openssh.com` 通道。
+    ///
+    /// 参数：channel 为服务端新开的 agent 通道，
+    /// reply 为接受/拒绝句柄（russh 默认实现只 accept 不应答，会话会一直挂着）
+    /// 核心流程：这个回调在会话读循环里 inline await，所以只做两件事：
+    /// 先 accept（立刻返回，绝不在回调里等对端报文）→ 再把通道 move 进常驻运行时的
+    /// 后台任务，由 `serve_agent_channel` 应答 agent 协议；
+    /// 没有私钥时同样起应答任务，只是身份列表为空，让对端立刻拿到确定结论而不是干等。
+    async fn server_channel_open_agent_forward(
+        &mut self,
+        channel: SshChannel,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        reply.accept().await;
+        let key = self.agent_key.clone();
+        runtime().spawn(async move { serve_agent_channel(channel, key).await });
+        Ok(())
+    }
 }
 
 /// 计算 MD5 指纹。
@@ -323,6 +356,273 @@ fn md5_fingerprint(key: &russh::keys::PublicKey) -> String {
         }
         Err(_) => "MD5:不可用".to_string(),
     }
+}
+
+/// agent 通道上单帧的长度上限。
+///
+/// 参数：无
+/// 核心流程：对端（sshd 或堡垒机）正常帧只有几十到几千字节，
+/// 上限用来挡住畸形长度字段导致的巨额分配与无限等待。
+const AGENT_FRAME_LIMIT: u32 = 256 * 1024;
+
+/// `SSH_AGENTC_REQUEST_IDENTITIES`：对端索要身份列表。
+const AGENTC_REQUEST_IDENTITIES: u8 = 11;
+
+/// `SSH_AGENT_IDENTITIES_ANSWER`：身份列表应答。
+const AGENT_IDENTITIES_ANSWER: u8 = 12;
+
+/// `SSH_AGENTC_SIGN_REQUEST`：对端要求用某个公钥对一段数据签名。
+const AGENTC_SIGN_REQUEST: u8 = 13;
+
+/// `SSH_AGENT_SIGN_RESPONSE`：签名应答。
+const AGENT_SIGN_RESPONSE: u8 = 14;
+
+/// `SSH_AGENT_FAILURE`：这次请求做不了。
+const AGENT_FAILURE: u8 = 5;
+
+/// `SSH_AGENT_SUCCESS`：这次请求做完了（增删身份类请求用）。
+const AGENT_SUCCESS: u8 = 6;
+
+/// `SSH_AGENTC_ADD_IDENTITY`：对端想把一把私钥塞进 agent。
+const AGENTC_ADD_IDENTITY: u8 = 17;
+
+/// `SSH_AGENTC_REMOVE_IDENTITY`：对端想删掉某一把身份。
+const AGENTC_REMOVE_IDENTITY: u8 = 18;
+
+/// `SSH_AGENTC_REMOVE_ALL_IDENTITIES`：对端想清空所有身份。
+const AGENTC_REMOVE_ALL_IDENTITIES: u8 = 19;
+
+/// `SSH_AGENTC_ADD_ID_CONSTRAINED`：带约束的加身份。
+const AGENTC_ADD_ID_CONSTRAINED: u8 = 22;
+
+/// `SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED`：带约束的加智能卡身份。
+const AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED: u8 = 23;
+
+/// 身份列表里的注释文字。
+///
+/// 参数：无
+/// 核心流程：对端会对 identity 的注释原样显示（`ssh-add -l`），
+/// 这里写产品名，既不是空串也不泄露任何本机信息。
+const AGENT_KEY_COMMENT: &str = "rustmobax";
+
+/// agent 签名请求里「用 SHA-256 签 RSA」的标志位。
+const AGENT_RSA_SHA2_256: u32 = 2;
+
+/// agent 签名请求里「用 SHA-512 签 RSA」的标志位。
+const AGENT_RSA_SHA2_512: u32 = 4;
+
+/// 内置 agent 应答器：把一条 agent 通道当成请求/应答循环。
+///
+/// 参数：channel 为堡垒机反开的 agent 通道，
+/// key 为私钥认证用的同一份私钥（None 表示没走私钥认证）
+/// 核心流程：通道转成字节流 -> 循环「读 4 字节长度 + 读整帧」->
+/// 按帧首字节分派：要身份就回身份列表，要签名就回签名，增删身份一律回成功，
+/// 其余回失败 -> 写回应答（同样先写长度再写内容）并 flush ->
+/// 读端 EOF 或出错就静默收工，通道随字节流 drop 自动关闭。
+async fn serve_agent_channel(channel: SshChannel, key: Option<Arc<PrivateKey>>) {
+    let public = key.as_ref().map(|key| key.public_key().clone());
+    let mut stream = channel.into_stream();
+    loop {
+        let payload = match read_agent_frame(&mut stream, AGENT_FRAME_LIMIT).await {
+            Ok(Some(payload)) => payload,
+            // 对端关闭通道或读失败 -> 静默退出，绝不 panic
+            Ok(None) | Err(_) => break,
+        };
+        let Some(&kind) = payload.first() else {
+            // 空帧没有任何含义，丢掉继续读下一条
+            continue;
+        };
+        let reply = match kind {
+            AGENTC_REQUEST_IDENTITIES => agent_identities_answer(public.as_ref()),
+            AGENTC_SIGN_REQUEST => {
+                agent_sign_response(key.as_deref(), public.as_ref(), &payload[1..])
+            }
+            // 增删身份类请求：本 agent 只服务「用现有私钥签名」，照 OpenSSH 的语义
+            // 回成功即可（应用本来也不会往转发通道里塞私钥）
+            AGENTC_ADD_IDENTITY
+            | AGENTC_REMOVE_IDENTITY
+            | AGENTC_REMOVE_ALL_IDENTITIES
+            | AGENTC_ADD_ID_CONSTRAINED
+            | AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED => vec![AGENT_SUCCESS],
+            _ => vec![AGENT_FAILURE],
+        };
+        if write_agent_frame(&mut stream, &reply).await.is_err() {
+            break;
+        }
+    }
+}
+
+/// 生成身份列表应答帧。
+///
+/// 参数：public 为本机公钥（None 表示这次认证没用私钥）
+/// 核心流程：有公钥就回 `count = 1` + 公钥线格式 blob + 注释；
+/// 没有公钥就回 `count = 0`，让对端立刻知道「这个 agent 里没身份」而不是干等。
+fn agent_identities_answer(public: Option<&PublicKey>) -> Vec<u8> {
+    let blob = public.and_then(|key| key.to_bytes().ok());
+    let mut out = vec![AGENT_IDENTITIES_ANSWER];
+    match blob {
+        Some(blob) => {
+            put_u32(&mut out, 1);
+            put_ssh_string(&mut out, &blob);
+            put_ssh_string(&mut out, AGENT_KEY_COMMENT.as_bytes());
+        }
+        None => put_u32(&mut out, 0),
+    }
+    out
+}
+
+/// 处理签名请求，生成应答帧。
+///
+/// 参数：key/public 为本机私钥与公钥，body 为签名请求去掉首字节后的内容
+/// （`string key_blob` + `string data` + `u32 flags`）
+/// 核心流程：解出 key_blob、data、flags -> key_blob 与本机公钥不一致就回失败
+/// （只用自己的钥匙串，绝不对别人的 key 盲签）-> 按 flags 选哈希后签名 ->
+/// `string (算法名 + 签名) 的编码` 装进 SIGN_RESPONSE；
+/// 解析失败或签名失败一律回失败，绝不把异常抛给会话循环。
+fn agent_sign_response(
+    key: Option<&PrivateKey>,
+    public: Option<&PublicKey>,
+    body: &[u8],
+) -> Vec<u8> {
+    let (Some(key), Some(public)) = (key, public) else {
+        return vec![AGENT_FAILURE];
+    };
+    let mut cursor = 0usize;
+    let (Some(blob), Some(data)) = (
+        take_ssh_string(body, &mut cursor),
+        take_ssh_string(body, &mut cursor),
+    ) else {
+        return vec![AGENT_FAILURE];
+    };
+    let flags = take_u32(body, &mut cursor).unwrap_or(0);
+    let matches_local_key = public
+        .to_bytes()
+        .map(|local| local == blob)
+        .unwrap_or(false);
+    if !matches_local_key {
+        return vec![AGENT_FAILURE];
+    }
+    let Ok(signature) = sign_agent_data(key, data, flags) else {
+        return vec![AGENT_FAILURE];
+    };
+    let mut encoded = Vec::new();
+    if signature.encode(&mut encoded).is_err() {
+        return vec![AGENT_FAILURE];
+    }
+    let mut out = vec![AGENT_SIGN_RESPONSE];
+    put_ssh_string(&mut out, &encoded);
+    out
+}
+
+/// 用本机私钥对一段数据签名。
+///
+/// 参数：key 为私钥，data 为待签数据，flags 为 agent 请求里的标志位
+/// 核心流程：RSA 的签名算法由 flags 决定（2 -> SHA256、4 -> SHA512、否则老式 SHA1），
+/// 必须走 `(&RsaKeypair, hash)` 那个 Signer 实现；
+/// 其余密钥类型（ed25519、ecdsa 等）的哈希由算法本身定死，直接签。
+fn sign_agent_data(
+    key: &PrivateKey,
+    data: &[u8],
+    flags: u32,
+) -> Result<Signature, russh::keys::signature::Error> {
+    if let KeypairData::Rsa(keypair) = key.key_data() {
+        let hash = if flags & AGENT_RSA_SHA2_256 != 0 {
+            Some(HashAlg::Sha256)
+        } else if flags & AGENT_RSA_SHA2_512 != 0 {
+            Some(HashAlg::Sha512)
+        } else {
+            None
+        };
+        return Signer::try_sign(&(keypair, hash), data);
+    }
+    Signer::try_sign(key, data)
+}
+
+/// 读一整帧 agent 报文。
+///
+/// 参数：stream 为 agent 通道字节流，limit 为单帧长度上限
+/// 核心流程：先读满 4 字节大端长度 -> 校验上限（越界按协议错误处理，不分配内存）->
+/// 再按长度读满内容；对端正常关闭返回 None，读到一半断掉按错误返回。
+async fn read_agent_frame<S>(stream: &mut S, limit: u32) -> std::io::Result<Option<Vec<u8>>>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut len = [0u8; 4];
+    match stream.read_exact(&mut len).await {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(err) => return Err(err),
+    }
+    let len = u32::from_be_bytes(len);
+    if len > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "agent 帧长度越界",
+        ));
+    }
+    let mut payload = vec![0u8; len as usize];
+    match stream.read_exact(&mut payload).await {
+        Ok(_) => Ok(Some(payload)),
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// 写一整帧 agent 报文并 flush。
+///
+/// 参数：stream 为 agent 通道字节流，payload 为帧内容
+/// 核心流程：先写 4 字节大端长度再写内容，一次写满整帧后 flush，
+/// 避免应答卡在缓冲里让对端以为 agent 没反应。
+async fn write_agent_frame<S>(stream: &mut S, payload: &[u8]) -> std::io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    put_u32(&mut frame, payload.len() as u32);
+    frame.extend_from_slice(payload);
+    stream.write_all(&frame).await?;
+    stream.flush().await
+}
+
+/// 往报文里写一个 u32 大端整数。
+///
+/// 参数：out 为输出缓冲，value 为待写整数
+/// 核心流程：按网络字节序追加 4 字节。
+fn put_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+/// 往报文里写一个 SSH string。
+///
+/// 参数：out 为输出缓冲，bytes 为字符串内容（长度不超过 u32）
+/// 核心流程：先写 4 字节大端长度，再写内容本身。
+fn put_ssh_string(out: &mut Vec<u8>, bytes: &[u8]) {
+    put_u32(out, bytes.len() as u32);
+    out.extend_from_slice(bytes);
+}
+
+/// 从报文里读一个 u32 大端整数。
+///
+/// 参数：payload 为整帧内容，cursor 为当前读位置（读成功后前移 4）
+/// 核心流程：剩余不足 4 字节返回 None，由调用方按协议错误处理。
+fn take_u32(payload: &[u8], cursor: &mut usize) -> Option<u32> {
+    let end = (*cursor).checked_add(4)?;
+    let bytes = payload.get(*cursor..end)?;
+    *cursor = end;
+    Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+/// 从报文里读一个 SSH string。
+///
+/// 参数：payload 为整帧内容，cursor 为当前读位置（读成功后前移）
+/// 核心流程：先读 4 字节长度，再按长度切出内容；长度越界返回 None，
+/// 由调用方回 FAILURE，绝不越界索引。
+fn take_ssh_string<'a>(payload: &'a [u8], cursor: &mut usize) -> Option<&'a [u8]> {
+    let len = take_u32(payload, cursor)? as usize;
+    let end = (*cursor).checked_add(len)?;
+    let bytes = payload.get(*cursor..end)?;
+    *cursor = end;
+    Some(bytes)
 }
 
 /// 给跳板机这一跳的失败补上归属。
@@ -538,6 +838,17 @@ impl SshConnection {
     {
         let config = Arc::new(client::Config::default());
 
+        // 私钥提前加载：同一份 Arc 既用于认证，也交给 ClientHandler 应答 agent 通道。
+        // 认证时临时加载的写法在认证完就把私钥 drop 了，堡垒机随后反开 agent 通道时
+        // 就只剩一个没人应答的空通道（会话挂死、0 字节），所以必须提前。
+        let agent_key: Option<Arc<PrivateKey>> = match &options.auth {
+            SshAuth::Password(_) => None,
+            SshAuth::PrivateKey { path, passphrase } => Some(Arc::new(
+                russh::keys::load_secret_key(path, passphrase.as_deref())
+                    .map_err(|err| CoreError::Ssh(format!("读取私钥失败（{path}）：{err}")))?,
+            )),
+        };
+
         // 主机密钥探测 -> 把 check_server_key 的判定结果带回外层用于报错
         let probe = Arc::new(Mutex::new(HostKeyProbe::default()));
         let handler = ClientHandler {
@@ -547,6 +858,7 @@ impl SshConnection {
             accept_unknown: options.accept_unknown_host_key,
             probe: Arc::clone(&probe),
             forward,
+            agent_key: agent_key.clone(),
         };
 
         let mut session = match tokio::time::timeout(
@@ -584,10 +896,14 @@ impl SshConnection {
                     .map_err(|err| CoreError::Ssh(format!("认证异常：{err}")))?,
                 "认证失败：用户名或密码错误",
             ),
-            SshAuth::PrivateKey { path, passphrase } => {
-                let key = russh::keys::load_secret_key(path, passphrase.as_deref())
-                    .map_err(|err| CoreError::Ssh(format!("读取私钥失败（{path}）：{err}")))?;
-                let key = PrivateKeyWithHashAlg::new(Arc::new(key), None);
+            SshAuth::PrivateKey { path, .. } => {
+                // 私钥已在上面按同一分支加载 -> 这里取同一份 Arc，认证完也不会被 drop
+                let key = match agent_key.as_ref() {
+                    Some(key) => PrivateKeyWithHashAlg::new(Arc::clone(key), None),
+                    None => {
+                        return Err(CoreError::Ssh(format!("读取私钥失败（{path}）：私钥未加载")));
+                    }
+                };
                 (
                     session
                         .authenticate_publickey(&options.username, key)
@@ -626,8 +942,9 @@ impl SshConnection {
 
     /// 在连接上开一个交互式 shell 通道。
     ///
-    /// 参数：term 为终端类型，cols/rows 为初始尺寸
-    /// 核心流程：**先开交互 shell 通道**（`channel_open_session` → PTY → shell）→
+    /// 参数：term 为终端类型，cols/rows 为初始尺寸，
+    /// agent_forward 为是否在 PTY 与 shell 之间申请 agent 转发
+    /// 核心流程：**先开交互 shell 通道**（`channel_open_session` → PTY → 申请 agent 转发 → shell）→
     /// **再**用第二个 session 探远端登录 shell → 给 bash/zsh 装上 OSC 7 提示符钩子。
     /// 顺序不能反：PAM 的 motd 只发给本连接上的**第一个** session，
     /// 若让探测用的 exec 通道抢先，motd 会被它吃掉并丢弃，交互 shell（第二个 session）
@@ -635,7 +952,13 @@ impl SshConnection {
     /// 全部缓冲在 pending 里、一个都不丢，注入窗口里的回显则照旧吞掉；
     /// 探测失败或 shell 不支持时一个字节都不写，motd 与 shell 照常可用。
     /// 前三步各有独立的失败文案，成功后通道由调用方独占。
-    pub async fn open_shell(&self, term: &str, cols: u16, rows: u16) -> CoreResult<OpenedShell> {
+    pub async fn open_shell(
+        &self,
+        term: &str,
+        cols: u16,
+        rows: u16,
+        agent_forward: bool,
+    ) -> CoreResult<OpenedShell> {
         // 1) 先把交互 shell 通道占住「首个 session」的位置：motd 归它
         let mut channel = self
             .handle
@@ -647,6 +970,16 @@ impl SshConnection {
             .request_pty(false, term, u32::from(cols), u32::from(rows), 0, 0, &[])
             .await
             .map_err(|err| CoreError::Ssh(format!("申请 PTY 失败：{err}")))?;
+
+        // 堡垒机准入：PTY 之后、shell 之前申请 agent 转发（与 OpenSSH 的顺序一致），
+        // 服务端只校验客户端有没有发这个请求；want_reply 用 false，与 PTY/shell 一致，
+        // 避免多一条应答混进通道队列，被拒绝时只体现在服务端的 Failure 上
+        if agent_forward {
+            channel
+                .agent_forward(false)
+                .await
+                .map_err(|err| CoreError::Ssh(format!("申请 agent 转发失败：{err}")))?;
+        }
 
         channel
             .request_shell(false)
@@ -1196,7 +1529,7 @@ impl SshSession {
             let result = async {
                 let connection = SshConnection::connect_async(&store, &options).await?;
                 let channel = connection
-                    .open_shell(&options.term, options.cols, options.rows)
+                    .open_shell(&options.term, options.cols, options.rows, options.agent_forward)
                     .await?;
                 Ok((connection, channel))
             }
@@ -1421,6 +1754,40 @@ mod tests {
         Reject,
     }
 
+    /// 服务端在 agent 通道上观察到的东西（模拟堡垒机一侧的视角）。
+    ///
+    /// 无参数
+    /// 核心流程：服务端主动开 agent 通道后先要身份列表，再用拿到的公钥发一次签名请求；
+    /// 这里记下客户端回的原始应答，用例据此断言「真的有身份、真的签了名」。
+    #[derive(Default)]
+    struct AgentProbe {
+        /// 客户端回的身份列表里第一条公钥的线格式 blob。
+        identity_blob: Option<Vec<u8>>,
+        /// 身份列表里的 count 字段（应恒为 1）。
+        identity_count: u32,
+        /// 客户端回的签名（已编码的「算法名 + 签名」）。
+        signature: Option<Vec<u8>>,
+        /// 还没凑满一帧的残留字节（agent 帧可能被拆到多个 CHANNEL_DATA 里）。
+        pending: Vec<u8>,
+        /// 是否已经发过签名请求，避免重复发。
+        asked_signature: bool,
+    }
+
+    /// agent 签名请求里待签的数据（服务端自己构造，签名后原样验签）。
+    const AGENT_PROBE_DATA: &[u8] = b"rustmobax-agent-probe";
+
+    /// 把一段报文内容包成 agent 帧（4 字节大端长度 + 内容）。
+    ///
+    /// 参数：payload 为报文内容
+    /// 核心流程：与真实 agent 的写法一致，先写长度再写内容，
+    /// 让客户端的应答器按同一套规则解析。
+    fn agent_frame(payload: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(4 + payload.len());
+        put_u32(&mut frame, payload.len() as u32);
+        frame.extend_from_slice(payload);
+        frame
+    }
+
     /// 测试用服务端：接受任意密码，把收到的数据原样回显，
     /// 并具备跳板机能力（把 direct-tcpip 通道接到真实目标端口）。
     #[derive(Clone)]
@@ -1437,6 +1804,12 @@ mod tests {
         first_session_only: bool,
         /// 各连接上 shell 通道收到的字节（只记录客户端写进来的）。
         received: Arc<Mutex<Vec<u8>>>,
+        /// 各连接上收到的 agent 转发申请（记 session 序号，1 表示首条 session 通道）。
+        agent_requests: Arc<Mutex<Vec<u32>>>,
+        /// 收到 agent 转发申请后是否像堡垒机那样反开一条 agent 通道。
+        open_agent_channel: bool,
+        /// agent 通道上的观察结果，各连接共享一份。
+        agent_probe: Arc<Mutex<AgentProbe>>,
     }
 
     struct EchoHandler {
@@ -1455,6 +1828,111 @@ mod tests {
         session_ordinal: std::collections::HashMap<ChannelId, u32>,
         /// shell 通道收到的字节 -> 用例据此断言客户端到底发了什么。
         received: Arc<Mutex<Vec<u8>>>,
+        /// 每条 agent 转发申请到达时的 session 序号（1 = 首条 session 通道）。
+        agent_requests: Arc<Mutex<Vec<u32>>>,
+        /// 是否像堡垒机那样反开 agent 通道。
+        open_agent_channel: bool,
+        /// 本连接上反开出来的 agent 通道 id（None 表示没开）。
+        agent_channel: Option<ChannelId>,
+        /// agent 通道上的观察结果。
+        agent_probe: Arc<Mutex<AgentProbe>>,
+    }
+
+    impl EchoHandler {
+        /// 处理 agent 通道上收到的字节：攒帧、记账、回签名请求。
+        ///
+        /// 参数：data 为本轮收到的字节，session 为当前连接会话
+        /// 核心流程：字节先追加进残留缓冲，再按「4 字节长度 + 内容」切出所有完整帧
+        /// （一帧可能被拆到多个 CHANNEL_DATA 里，也可能几条挤在一个里）->
+        /// 逐帧交给 `handle_agent_frame`；没有 agent 通道就原样返回。
+        async fn handle_agent_data(
+            &mut self,
+            data: &[u8],
+            session: &mut Session,
+        ) -> Result<(), russh::Error> {
+            let Some(channel) = self.agent_channel else {
+                return Ok(());
+            };
+            let mut frames = Vec::new();
+            {
+                let Ok(mut probe) = self.agent_probe.lock() else {
+                    return Ok(());
+                };
+                probe.pending.extend_from_slice(data);
+                loop {
+                    let buffered = &probe.pending;
+                    if buffered.len() < 4 {
+                        break;
+                    }
+                    let len =
+                        u32::from_be_bytes([buffered[0], buffered[1], buffered[2], buffered[3]])
+                            as usize;
+                    if buffered.len() < 4 + len {
+                        break;
+                    }
+                    frames.push(buffered[4..4 + len].to_vec());
+                    probe.pending.drain(..4 + len);
+                }
+            }
+            for frame in frames {
+                self.handle_agent_frame(channel, &frame, session).await;
+            }
+            Ok(())
+        }
+
+        /// 按报文类型处理一帧 agent 报文。
+        ///
+        /// 参数：channel 为 agent 通道，frame 为一帧内容，session 为当前连接会话
+        /// 核心流程：身份列表应答 -> 记下 count 与第一条公钥 blob，并立刻用这把公钥
+        /// 发一帧签名请求（模拟堡垒机「拿到身份后验证能不能签」）->
+        /// 签名应答 -> 记下签名；其余类型忽略，解析失败也只是少一条记录。
+        async fn handle_agent_frame(
+            &mut self,
+            channel: ChannelId,
+            frame: &[u8],
+            session: &mut Session,
+        ) {
+            let Some(&kind) = frame.first() else {
+                return;
+            };
+            let body = &frame[1..];
+            let mut cursor = 0usize;
+            match kind {
+                AGENT_IDENTITIES_ANSWER => {
+                    let count = take_u32(body, &mut cursor).unwrap_or(0);
+                    let blob = take_ssh_string(body, &mut cursor).map(<[u8]>::to_vec);
+                    let ask = {
+                        let Ok(mut probe) = self.agent_probe.lock() else {
+                            return;
+                        };
+                        probe.identity_count = count;
+                        probe.identity_blob = blob.clone();
+                        let ask = !probe.asked_signature && blob.is_some();
+                        if ask {
+                            probe.asked_signature = true;
+                        }
+                        ask
+                    };
+                    if ask {
+                        if let Some(blob) = blob {
+                            let mut payload = vec![AGENTC_SIGN_REQUEST];
+                            put_ssh_string(&mut payload, &blob);
+                            put_ssh_string(&mut payload, AGENT_PROBE_DATA);
+                            put_u32(&mut payload, 0);
+                            let _ = session.data(channel, agent_frame(&payload));
+                        }
+                    }
+                }
+                AGENT_SIGN_RESPONSE => {
+                    if let Some(signature) = take_ssh_string(body, &mut cursor) {
+                        if let Ok(mut probe) = self.agent_probe.lock() {
+                            probe.signature = Some(signature.to_vec());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     impl server::Handler for EchoHandler {
@@ -1502,6 +1980,50 @@ mod tests {
                 return Ok(());
             }
             let _ = session.data(channel, format!("{}\r\n", self.banner).into_bytes());
+            Ok(())
+        }
+
+        /// 堡垒机准入检查：记录客户端发来的 agent 转发申请；需要时反开 agent 通道。
+        ///
+        /// 参数：channel 为申请所在通道，session 为当前连接会话
+        /// 核心流程：把该通道的 session 序号记账（1 = 首条 session 通道）→
+        /// 若本台服务端模拟的是堡垒机，就在这条连接上反开一条 `auth-agent@openssh.com`
+        /// 通道（只发 open 报文、立刻返回 ChannelId，真正的报文交换在
+        /// `channel_open_confirmation` 与 `data` 里做，回调里绝不等待）→
+        /// 返回 Ok(true) 让 russh 自动回 Success。
+        async fn agent_request(
+            &mut self,
+            channel: ChannelId,
+            session: &mut Session,
+        ) -> Result<bool, Self::Error> {
+            let ordinal = self.session_ordinal.get(&channel).copied().unwrap_or(0);
+            if let Ok(mut log) = self.agent_requests.lock() {
+                log.push(ordinal);
+            }
+            if self.open_agent_channel {
+                if let Ok(agent_channel) = session.channel_open_agent() {
+                    self.agent_channel = Some(agent_channel);
+                }
+            }
+            Ok(true)
+        }
+
+        /// 自己开出的 agent 通道被客户端确认后，立刻索要身份列表。
+        ///
+        /// 参数：id 为被确认的通道，max_packet_size/window_size 为对端给的窗口参数
+        /// 核心流程：只有 id 是本连接上那条 agent 通道才动手 -> 发一帧
+        /// `SSH_AGENTC_REQUEST_IDENTITIES`（长度 1 + 类型 11）；
+        /// 其余通道（session 等）原样放过。
+        async fn channel_open_confirmation(
+            &mut self,
+            id: ChannelId,
+            _max_packet_size: u32,
+            _window_size: u32,
+            session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            if self.agent_channel == Some(id) {
+                let _ = session.data(id, agent_frame(&[AGENTC_REQUEST_IDENTITIES]));
+            }
             Ok(())
         }
 
@@ -1593,6 +2115,10 @@ mod tests {
             data: &[u8],
             session: &mut Session,
         ) -> Result<(), Self::Error> {
+            // agent 通道上的字节是 agent 协议帧，绝不能回显（回显等于把请求打回去）
+            if self.agent_channel == Some(channel) {
+                return self.handle_agent_data(data, session).await;
+            }
             // 转发通道的数据由 relay 任务送往真实目标 -> 这里不能再回显
             if self
                 .relayed
@@ -1628,6 +2154,10 @@ mod tests {
                 session_seq: 0,
                 session_ordinal: std::collections::HashMap::new(),
                 received: Arc::clone(&self.received),
+                agent_requests: Arc::clone(&self.agent_requests),
+                open_agent_channel: self.open_agent_channel,
+                agent_channel: None,
+                agent_probe: Arc::clone(&self.agent_probe),
             }
         }
     }
@@ -1704,7 +2234,9 @@ mod tests {
         exec_mode: ExecMode,
         prompt: bool,
     ) -> (u16, Arc<Mutex<Vec<u8>>>) {
-        spawn_full_server_with(banner, exec_mode, prompt, false).await
+        let (port, received, _agent_requests) =
+            spawn_full_server_with(banner, exec_mode, prompt, false).await;
+        (port, received)
     }
 
     /// 起一台「motd 只发给本连接第一个 session」的服务端（模拟 PAM 的真实行为）。
@@ -1716,7 +2248,9 @@ mod tests {
         motd: &'static str,
         exec_mode: ExecMode,
     ) -> (u16, Arc<Mutex<Vec<u8>>>) {
-        spawn_full_server_with(motd, exec_mode, true, true).await
+        let (port, received, _agent_requests) =
+            spawn_full_server_with(motd, exec_mode, true, true).await;
+        (port, received)
     }
 
     /// 起一个可配置 exec 行为与提示符行为的本地 SSH 服务端。
@@ -1724,14 +2258,52 @@ mod tests {
     /// 参数：banner 为 shell 建立后先吐的标记文字，exec_mode 为 exec 应答方式，
     /// prompt 为是否在回显后补提示符，
     /// first_session_only 为「banner 是否只发给本连接的第一条 session」
-    /// 核心流程：绑 127.0.0.1:0 拿随机端口 → 后台跑 russh server →
-    /// 返回端口与服务端收到的字节（用于反推客户端到底写了什么）。
+    /// 核心流程：转调底层启动函数（不反开 agent 通道），只交回端口、
+    /// 服务端收到的字节与 agent 转发申请的记录，保持既有用例签名不变。
     async fn spawn_full_server_with(
         banner: &'static str,
         exec_mode: ExecMode,
         prompt: bool,
         first_session_only: bool,
-    ) -> (u16, Arc<Mutex<Vec<u8>>>) {
+    ) -> (u16, Arc<Mutex<Vec<u8>>>, Arc<Mutex<Vec<u32>>>) {
+        let (port, received, agent_requests, _probe) =
+            spawn_server_inner(banner, exec_mode, prompt, first_session_only, false).await;
+        (port, received, agent_requests)
+    }
+
+    /// 起一台「像堡垒机」的服务端：收到 agent 转发申请后反开 agent 通道。
+    ///
+    /// 参数：无
+    /// 核心流程：用默认 banner 与 prompt 行为启动，唯一差异是打开
+    /// `open_agent_channel`；返回端口与 agent 通道上的观察结果，
+    /// 用例据此断言客户端应答器的身份列表与签名。
+    async fn spawn_agent_probe_server() -> (u16, Arc<Mutex<AgentProbe>>) {
+        let (port, _received, _agent_requests, probe) =
+            spawn_server_inner("WELCOME", ExecMode::Fixed("bash"), true, false, true).await;
+        (port, probe)
+    }
+
+    /// 底层启动函数：绑端口、生成主机密钥、后台跑 russh server。
+    ///
+    /// 参数：banner 为 shell 建立后先吐的标记文字，exec_mode 为 exec 应答方式，
+    /// prompt 为是否在回显后补提示符，
+    /// first_session_only 为「banner 是否只发给本连接的第一条 session」，
+    /// open_agent_channel 为是否像堡垒机那样反开 agent 通道
+    /// 核心流程：绑 127.0.0.1:0 拿随机端口 → 后台跑 russh server →
+    /// 返回端口、服务端收到的字节（用于反推客户端到底写了什么）、
+    /// agent 转发申请记录（用于断言堡垒机准入请求发没发）与 agent 通道观察结果。
+    async fn spawn_server_inner(
+        banner: &'static str,
+        exec_mode: ExecMode,
+        prompt: bool,
+        first_session_only: bool,
+        open_agent_channel: bool,
+    ) -> (
+        u16,
+        Arc<Mutex<Vec<u8>>>,
+        Arc<Mutex<Vec<u32>>>,
+        Arc<Mutex<AgentProbe>>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("应能绑定端口");
         let port = listener.local_addr().expect("应能取到本地地址").port();
 
@@ -1748,6 +2320,10 @@ mod tests {
 
         let received: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let received_for_server = Arc::clone(&received);
+        let agent_requests: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        let agent_requests_for_server = Arc::clone(&agent_requests);
+        let agent_probe: Arc<Mutex<AgentProbe>> = Arc::new(Mutex::new(AgentProbe::default()));
+        let agent_probe_for_server = Arc::clone(&agent_probe);
         tokio::spawn(async move {
             let mut server = EchoServer {
                 banner,
@@ -1756,11 +2332,14 @@ mod tests {
                 prompt,
                 first_session_only,
                 received: received_for_server,
+                agent_requests: agent_requests_for_server,
+                open_agent_channel,
+                agent_probe: agent_probe_for_server,
             };
             let _ = server.run_on_socket(config, &listener).await;
         });
 
-        (port, received)
+        (port, received, agent_requests, agent_probe)
     }
 
     #[test]
@@ -1780,6 +2359,7 @@ mod tests {
                 rows: 30,
                 term: "xterm-256color".into(),
                 accept_unknown_host_key: true,
+                agent_forward: false,
                 jump: None,
             },
             Box::new(move |output| {
@@ -1828,6 +2408,87 @@ mod tests {
         session.close().expect("关闭应成功");
     }
 
+    /// 等 agent 转发申请记录出现（最多等几秒）。
+    ///
+    /// 参数：log 为服务端记账，limit 为期望的条数
+    /// 核心流程：报文与应答都是异步的，开完 shell 之后还要给服务端一点时间回填，
+    /// 记录够数就立刻返回，避免用固定 sleep 拖慢全部用例。
+    fn wait_for_agent_requests(log: &Arc<Mutex<Vec<u32>>>, limit: usize) -> Vec<u32> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let seen = log.lock().map(|inner| inner.clone()).unwrap_or_default();
+            if seen.len() >= limit || std::time::Instant::now() > deadline {
+                return seen;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn agent_forwarding_request_is_sent_before_shell() {
+        let store = runtime().block_on(async { Store::open_in_memory().await }).expect("内存库");
+        let (port, _received, agent_requests) = runtime().block_on(spawn_full_server_with(
+            "WELCOME",
+            ExecMode::Echo,
+            true,
+            false,
+        ));
+        let options = SshOptions {
+            agent_forward: true,
+            ..echo_options(port, true)
+        };
+
+        let connection = SshConnection::connect(&store, &options).expect("应能连上测试服务端");
+        // 这次调用按 PTY -> agent 转发 -> shell 的顺序发请求，能返回就说明 shell 已经被接受
+        let opened = runtime()
+            .block_on(connection.open_shell("xterm-256color", 80, 24, options.agent_forward))
+            .expect("应能在连接上开 shell 通道");
+
+        let requests = wait_for_agent_requests(&agent_requests, 1);
+        assert_eq!(
+            requests,
+            vec![1],
+            "应在首条 session 通道上恰好申请一次 agent 转发，实际：{requests:?}"
+        );
+
+        // shell 通道本身照常可用 -> 申请没有把通道搞坏
+        let mut shell = opened.channel;
+        let seen = pending_then_channel(&opened.pending, &mut shell, "WELCOME");
+        assert!(seen.contains("WELCOME"), "shell 通道应照常输出，实际：{seen:?}");
+    }
+
+    #[test]
+    fn agent_forwarding_is_skipped_when_disabled() {
+        let store = runtime().block_on(async { Store::open_in_memory().await }).expect("内存库");
+        let (port, _received, agent_requests) = runtime().block_on(spawn_full_server_with(
+            "WELCOME",
+            ExecMode::Echo,
+            true,
+            false,
+        ));
+        // echo_options 的 agent_forward 为 false -> 这条连接不应该发任何申请
+        let options = echo_options(port, true);
+
+        let connection = SshConnection::connect(&store, &options).expect("应能连上测试服务端");
+        let opened = runtime()
+            .block_on(connection.open_shell("xterm-256color", 80, 24, options.agent_forward))
+            .expect("应能在连接上开 shell 通道");
+
+        // 服务端按报文顺序处理 -> 已经吐出 shell 的 banner，说明申请要么早到、要么根本没发，
+        // 此刻读记账就是终局结果，不需要再等
+        let mut shell = opened.channel;
+        let seen = pending_then_channel(&opened.pending, &mut shell, "WELCOME");
+        assert!(seen.contains("WELCOME"), "shell 通道应照常输出，实际：{seen:?}");
+        let requests = agent_requests
+            .lock()
+            .map(|log| log.clone())
+            .unwrap_or_default();
+        assert!(
+            requests.is_empty(),
+            "关掉开关后不该发 agent 转发申请，实际：{requests:?}"
+        );
+    }
+
     /// 构造一套指向本地 echo 服务端的连接参数。
     ///
     /// 参数：port 为服务端端口，accept 为是否已确认指纹
@@ -1842,6 +2503,7 @@ mod tests {
             rows: 24,
             term: "xterm-256color".into(),
             accept_unknown_host_key: accept,
+            agent_forward: false,
             jump: None,
         }
     }
@@ -1922,11 +2584,27 @@ mod tests {
     /// 参数：无
     /// 核心流程：返回 (私钥路径, 临时目录)，测试结束时由调用方清理。
     fn write_temp_key() -> (std::path::PathBuf, std::path::PathBuf) {
+        let (path, dir, _public) = write_temp_key_pair();
+        (path, dir)
+    }
+
+    /// 生成一对测试密钥并写到临时目录，同时把公钥交回来。
+    ///
+    /// 参数：无
+    /// 核心流程：密钥在测试运行时随机生成（不落任何固定路径、不含任何真实凭据）->
+    /// 导出 OpenSSH 私钥写进临时目录 -> 返回 (私钥路径, 临时目录, 公钥)；
+    /// 公钥用于和 agent 应答里的身份 blob 逐字节比对。
+    fn write_temp_key_pair() -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        russh::keys::PublicKey,
+    ) {
         let key = russh::keys::PrivateKey::random(
             &mut rand::rng(),
             russh::keys::Algorithm::Ed25519,
         )
         .expect("应能生成密钥");
+        let public = key.public_key().clone();
         let dir = std::env::temp_dir().join(format!(
             "rmx-key-{}-{:?}",
             std::process::id(),
@@ -1938,7 +2616,86 @@ mod tests {
             .to_openssh(russh::keys::ssh_key::LineEnding::LF)
             .expect("应能导出 OpenSSH 私钥");
         std::fs::write(&path, pem.as_bytes()).expect("应能写私钥文件");
-        (path, dir)
+        (path, dir, public)
+    }
+
+    /// 等 agent 通道上「身份列表 + 签名」两样东西都到齐。
+    ///
+    /// 参数：probe 为服务端在 agent 通道上的观察结果
+    /// 核心流程：报文往返是异步的，最多等 10 秒；两样都到齐就立刻返回，
+    /// 超时则把当时看到的内容原样交回，由用例给出具体失败现场。
+    fn wait_for_agent_probe(
+        probe: &Arc<Mutex<AgentProbe>>,
+    ) -> (u32, Option<Vec<u8>>, Option<Vec<u8>>) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let snapshot = probe
+                .lock()
+                .map(|state| {
+                    (
+                        state.identity_count,
+                        state.identity_blob.clone(),
+                        state.signature.clone(),
+                    )
+                })
+                .unwrap_or_default();
+            if (snapshot.1.is_some() && snapshot.2.is_some())
+                || std::time::Instant::now() > deadline
+            {
+                return snapshot;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// 堡垒机反开 agent 通道后，客户端应答器要交出本机身份并能完成签名。
+    ///
+    /// 参数：无
+    /// 核心流程：起一台会反开 agent 通道的服务端（模拟堡垒机）->
+    /// 用临时私钥认证并在 shell 通道上申请 agent 转发 -> 服务端据此反开通道、
+    /// 先要身份列表、再用拿到的公钥发一帧签名请求 ->
+    /// 断言身份列表里恰好一个身份且就是本机公钥、签名非空且能被本机公钥验过。
+    #[test]
+    fn agent_channel_serves_identity_and_signature() {
+        let store = runtime().block_on(async { Store::open_in_memory().await }).expect("内存库");
+        let (port, probe) = runtime().block_on(spawn_agent_probe_server());
+        let (key_path, dir, public) = write_temp_key_pair();
+        let expected = public.to_bytes().expect("应能编码公钥");
+
+        let options = SshOptions {
+            auth: SshAuth::PrivateKey {
+                path: key_path.to_string_lossy().to_string(),
+                passphrase: None,
+            },
+            agent_forward: true,
+            ..echo_options(port, true)
+        };
+        let connection = SshConnection::connect(&store, &options).expect("应能连上测试服务端");
+        // 开 shell 会按 PTY -> agent 转发 -> shell 的顺序发请求，
+        // 服务端正是在 agent 转发申请里反开通道的
+        let _opened = runtime()
+            .block_on(connection.open_shell("xterm-256color", 80, 24, true))
+            .expect("应能在连接上开 shell 通道");
+
+        let (count, blob, signature) = wait_for_agent_probe(&probe);
+        assert_eq!(count, 1, "agent 应回恰好一个身份");
+        assert_eq!(
+            blob.as_deref(),
+            Some(expected.as_slice()),
+            "身份列表里的公钥 blob 应与本机公钥一致"
+        );
+
+        let signature = signature.expect("应收到 SIGN_RESPONSE");
+        assert!(!signature.is_empty(), "签名内容不能为空");
+        // 用本机公钥验签 -> 证明回来的确实是这把钥匙对请求数据的签名
+        let mut reader = signature.as_slice();
+        let parsed = russh::keys::ssh_encoding::Decode::decode(&mut reader)
+            .expect("SIGN_RESPONSE 里应是合法签名");
+        russh::keys::signature::Verifier::verify(&public, AGENT_PROBE_DATA, &parsed)
+            .expect("签名应能被本机公钥验过");
+
+        let _ = connection.disconnect();
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -1999,6 +2756,7 @@ mod tests {
                 rows: 24,
                 term: "xterm-256color".into(),
                 accept_unknown_host_key: true,
+                agent_forward: false,
                 jump: None,
             },
             Box::new(|_| {}),
@@ -2098,7 +2856,7 @@ mod tests {
             .expect("应能建立连接");
 
         let opened = runtime()
-            .block_on(connection.open_shell("xterm-256color", 80, 24))
+            .block_on(connection.open_shell("xterm-256color", 80, 24, false))
             .expect("应能在连接上开 shell 通道");
         let mut shell = opened.channel;
         let shell_id = shell.id();
@@ -2325,7 +3083,7 @@ mod tests {
         let connection = SshConnection::connect(&store, &echo_options(port, true))
             .expect("应能连上测试服务端");
         let opened = runtime()
-            .block_on(connection.open_shell("xterm-256color", 80, 24))
+            .block_on(connection.open_shell("xterm-256color", 80, 24, false))
             .expect("应能在连接上开 shell 通道");
         let mut shell = opened.channel;
 
@@ -2383,7 +3141,7 @@ mod tests {
         let connection = SshConnection::connect(&store, &echo_options(port, true))
             .expect("应能连上测试服务端");
         let opened = runtime()
-            .block_on(connection.open_shell("xterm-256color", 80, 24))
+            .block_on(connection.open_shell("xterm-256color", 80, 24, false))
             .expect("应能在连接上开 shell 通道");
         let mut shell = opened.channel;
 
@@ -2418,7 +3176,7 @@ mod tests {
         let connection = SshConnection::connect(&store, &echo_options(port, true))
             .expect("应能连上测试服务端");
         let opened = runtime()
-            .block_on(connection.open_shell("xterm-256color", 80, 24))
+            .block_on(connection.open_shell("xterm-256color", 80, 24, false))
             .expect("应能在连接上开 shell 通道");
 
         let pending = String::from_utf8_lossy(&opened.pending).to_string();
@@ -2453,7 +3211,7 @@ mod tests {
         let connection = SshConnection::connect(&store, &echo_options(port, true))
             .expect("应能连上测试服务端");
         let opened = runtime()
-            .block_on(connection.open_shell("xterm-256color", 80, 24))
+            .block_on(connection.open_shell("xterm-256color", 80, 24, false))
             .expect("应能在连接上开 shell 通道");
         let mut shell = opened.channel;
 
@@ -2492,7 +3250,7 @@ mod tests {
         let connection = SshConnection::connect(&store, &echo_options(port, true))
             .expect("应能连上测试服务端");
         let opened = runtime()
-            .block_on(connection.open_shell("xterm-256color", 80, 24))
+            .block_on(connection.open_shell("xterm-256color", 80, 24, false))
             .expect("应能在连接上开 shell 通道");
         let mut shell = opened.channel;
 
@@ -2523,7 +3281,7 @@ mod tests {
         let connection = SshConnection::connect(&store, &echo_options(port, true))
             .expect("应能连上测试服务端");
         let opened = runtime()
-            .block_on(connection.open_shell("xterm-256color", 80, 24))
+            .block_on(connection.open_shell("xterm-256color", 80, 24, false))
             .expect("应能在连接上开 shell 通道");
         let mut shell = opened.channel;
 
@@ -2581,7 +3339,7 @@ mod tests {
         let connection = SshConnection::connect(&store, &echo_options(port, true))
             .expect("应能连上测试服务端");
         let opened = runtime()
-            .block_on(connection.open_shell("xterm-256color", 80, 24))
+            .block_on(connection.open_shell("xterm-256color", 80, 24, false))
             .expect("应能在连接上开 shell 通道");
 
         let pending = String::from_utf8_lossy(&opened.pending).to_string();
@@ -2623,7 +3381,7 @@ mod tests {
         let connection = SshConnection::connect(&store, &echo_options(port, true))
             .expect("应能连上测试服务端");
         let opened = runtime()
-            .block_on(connection.open_shell("xterm-256color", 80, 24))
+            .block_on(connection.open_shell("xterm-256color", 80, 24, false))
             .expect("探测失败也不该让开 shell 失败");
         let mut shell = opened.channel;
 
@@ -2664,7 +3422,7 @@ mod tests {
         let connection = SshConnection::connect(&store, &echo_options(port, true))
             .expect("应能连上测试服务端");
         let opened = runtime()
-            .block_on(connection.open_shell("xterm-256color", 80, 24))
+            .block_on(connection.open_shell("xterm-256color", 80, 24, false))
             .expect("应能在连接上开 shell 通道");
 
         let pending = String::from_utf8_lossy(&opened.pending).to_string();
@@ -2793,7 +3551,7 @@ mod tests {
         )
         .expect("应能经跳板连到目标");
         let opened = runtime()
-            .block_on(connection.open_shell("xterm-256color", 80, 24))
+            .block_on(connection.open_shell("xterm-256color", 80, 24, false))
             .expect("应在目标机上开出 shell");
         let mut shell = opened.channel;
 
@@ -2836,7 +3594,7 @@ mod tests {
         // 目标连接内部持有跳板 -> 丢掉本地跳板句柄后目标仍应可用
         drop(jumper);
         let opened = runtime()
-            .block_on(target.open_shell("xterm-256color", 80, 24))
+            .block_on(target.open_shell("xterm-256color", 80, 24, false))
             .expect("跳板句柄释放后目标连接仍应可用");
         let mut shell = opened.channel;
         assert!(

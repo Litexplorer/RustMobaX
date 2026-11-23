@@ -111,6 +111,8 @@ export type SshStartRequest = {
   rows: number;
   /** 用户已确认过该主机指纹。 */
   acceptUnknownHostKey: boolean;
+  /** 是否转发本机 SSH Agent；缺省 true，堡垒机登录依赖它。 */
+  agentForward?: boolean;
 };
 
 /**

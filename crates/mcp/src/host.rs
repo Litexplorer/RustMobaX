@@ -55,6 +55,8 @@ pub struct SshSpec {
     pub term: String,
     /// 用户是否已确认接受未知主机指纹。
     pub accept_unknown_host_key: bool,
+    /// 是否向远端申请 agent 转发，缺省为真（堡垒机准入常见要求）。
+    pub agent_forward: Option<bool>,
     /// 认证方式。
     pub auth: SshAuthSpec,
 }

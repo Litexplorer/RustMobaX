@@ -48,6 +48,11 @@ type SshExtra = {
    */
   passphraseCredentialId?: string;
   x11Forwarding?: boolean;
+  /**
+   * SSH Agent 转发；缺省视为开启，只有用户明确关闭时才落库 false。
+   * 堡垒机登录依赖本机转发进来的 agent。
+   */
+  agentForwarding?: boolean;
   executeCommand?: string;
   /**
    * WSL 发行版名；空串或缺省表示用 WSL 默认发行版。
@@ -111,6 +116,8 @@ function buildExtra(extra: SshExtra): string | null {
   const credential = extra.credentialId?.trim();
   if (credential) compact.credentialId = credential;
   if (extra.x11Forwarding) compact.x11Forwarding = true;
+  // Agent 转发默认开启 -> 只有用户明确关掉时才写 false，保持 extra 简洁
+  if (extra.agentForwarding === false) compact.agentForwarding = false;
   const command = extra.executeCommand?.trim();
   if (command) compact.executeCommand = command;
   // 发行版只在选了具体发行版时才落库 -> 「默认发行版」不写这个键
@@ -245,6 +252,8 @@ export function SessionDialog(props: Props) {
   const [keyHasPassphrase, setKeyHasPassphrase] = useState(initialExtra.keyHasPassphrase === true);
   const [credentialId, setCredentialId] = useState(initialExtra.credentialId ?? "");
   const [x11Forwarding, setX11Forwarding] = useState(initialExtra.x11Forwarding === true);
+  // Agent 转发缺省开启：老会话没有这个键时按开启处理
+  const [agentForwarding, setAgentForwarding] = useState(initialExtra.agentForwarding !== false);
   const [executeCommand, setExecuteCommand] = useState(initialExtra.executeCommand ?? "");
   const [wslDistro, setWslDistro] = useState(initialExtra.wslDistro ?? "");
   /** 已安装的 WSL 发行版；null 表示还没查回来（加载中） */
@@ -450,6 +459,7 @@ export function SessionDialog(props: Props) {
         // 编辑时原样带回去，避免一次保存就把口令凭据引用抹掉
         passphraseCredentialId: initialExtra.passphraseCredentialId,
         x11Forwarding,
+        agentForwarding,
         executeCommand,
         // 只有 WSL 会话才落发行版；其它协议的残留值一并丢掉
         wslDistro: protocol === "wsl" ? wslDistro : "",
@@ -790,6 +800,19 @@ export function SessionDialog(props: Props) {
                       X11 转发
                     </label>
                     <span className="setting-note">远程图形程序显示到本地桌面</span>
+                  </div>
+
+                  <div className="setting-row">
+                    <label className="setting-label">
+                      <input
+                        type="checkbox"
+                        className="inline-check"
+                        checked={agentForwarding}
+                        onChange={(event) => setAgentForwarding(event.target.checked)}
+                      />
+                      开启 Agent 转发（堡垒机登录需要）
+                    </label>
+                    <span className="setting-note">默认开启；仅在明确知道不需要时关闭</span>
                   </div>
 
                   <div className="setting-row">

@@ -305,6 +305,7 @@ impl DesktopHost {
             rows,
             term: "xterm-256color".to_string(),
             accept_unknown_host_key: false,
+            agent_forward: Some(true),
             auth,
         };
         let opened = self

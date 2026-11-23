@@ -286,6 +286,8 @@ pub async fn tunnel_start(
         // （错误 kind=hostKeyUnknown 带 detail）后调 trust_host_key 再重试
         accept_unknown_host_key: false,
         jump: None,
+        // 隧道只开转发通道，没有 session 通道，不需要 agent 转发
+        agent_forward: false,
     };
 
     let kind = TunnelKind::parse(&config.kind).ok_or_else(|| {

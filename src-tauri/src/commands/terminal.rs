@@ -476,6 +476,18 @@ pub struct SshStartRequest {
     /// 可选的一跳跳板机；缺省即直连。
     #[serde(default)]
     pub jump: Option<JumpRequest>,
+    /// 是否向远端申请 agent 转发；缺省为 true。
+    #[serde(default = "default_true")]
+    pub agent_forward: bool,
+}
+
+/// agent 转发的缺省值。
+///
+/// 无参数
+/// 核心流程：企业堡垒机把「客户端必须申请 agent 转发」当成准入条件，
+/// 旧配置与旧前端都不带这个字段，缺省按开启处理才不会一升级就连不上。
+fn default_true() -> bool {
+    true
 }
 
 /// 把请求里的认证方式解成真正的凭据。
@@ -524,6 +536,8 @@ pub(crate) async fn resolve_jump(
         term: "xterm-256color".to_string(),
         accept_unknown_host_key: jump.accept_unknown_host_key,
         jump: None,
+        // 跳板机只开 direct-tcpip，没有 session 通道，发不了这个请求
+        agent_forward: false,
     })))
 }
 
@@ -564,6 +578,7 @@ pub async fn start_ssh_terminal(
         term: "xterm-256color".to_string(),
         accept_unknown_host_key: request.accept_unknown_host_key,
         jump,
+        agent_forward: request.agent_forward,
     };
 
     let store = state.store.clone();
