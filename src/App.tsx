@@ -406,6 +406,68 @@ function resolveSshAuth(
   return { kind: "needPassword" };
 }
 
+/**
+ * 一个已打开的标签实例。
+ *
+ * id 是标签实例标识（同一会话可以开多个标签，各自独立），
+ * sessionId 指向它渲染的会话。分屏、渲染 key、快捷键遍历都用实例 id，
+ * 会话相关的内存态（认证、主机指纹信任）按 sessionId 记，
+ * 终端 id 则按标签实例 id 记：同一会话的多个标签各有自己的终端。
+ */
+type OpenTab = { id: string; sessionId: string };
+
+/**
+ * 一个标签实例交给 TerminalPanel 的三个回调。
+ *
+ * 参数：分别是终端 id 上报、未知主机指纹、指纹变更，
+ * 签名与 TerminalPanel 的 props 对齐（面板回传的 sessionId 只用于指纹提示）。
+ */
+type TabPanelHandlers = {
+  onTerminalId: (sessionId: string, terminalId: string | null, expectedId?: string) => void;
+  onHostKeyPrompt: (sessionId: string, info: HostKeyInfo) => void;
+  onHostKeyMismatch: (sessionId: string, info: HostKeyInfo) => void;
+};
+
+/**
+ * 生成下一个标签实例 id。
+ *
+ * 参数：tabs 为当前标签列表，sessionId 为该标签指向的会话
+ * 核心流程：扫出同一会话已用过的最大序号再加一，拼成 `<sessionId>-<序号>`。
+ * 不用时间戳也不依赖调用次数：同一份标签列表算出的结果永远相同，
+ * 而序号在同一会话内单调递增，列表里因此不会重名。
+ */
+function nextTabInstanceId(tabs: OpenTab[], sessionId: string): string {
+  const prefix = `${sessionId}-`;
+  let maxSeq = 0;
+  for (const tab of tabs) {
+    if (!tab.id.startsWith(prefix)) continue;
+    const seq = Number.parseInt(tab.id.slice(prefix.length), 10);
+    if (Number.isFinite(seq) && seq > maxSeq) maxSeq = seq;
+  }
+  return `${prefix}${maxSeq + 1}`;
+}
+
+/**
+ * 从标签列表里移除指定实例，并在当前激活项被移除时挑一个相邻实例接管。
+ *
+ * 参数：tabs 为当前标签列表，removeIds 为要移除的标签实例 id，
+ * activeId 为当前活动实例 id
+ * 核心流程：按实例 id 过滤；只有活动项真的被移除时才改活动项，
+ * 位置取活动实例原来的下标，越界就落到最后一个（与关闭标签的回退一致）。
+ * closeTab 与 forgetAndClose 共用它，避免两处各写一遍相邻回退。
+ */
+function removeTabsAndPickActive(
+  tabs: OpenTab[],
+  removeIds: Set<string>,
+  activeId: string | null,
+): { tabs: OpenTab[]; activeId: string | null } {
+  const next = tabs.filter((tab) => !removeIds.has(tab.id));
+  if (next.length === tabs.length) return { tabs, activeId };
+  if (activeId === null || !removeIds.has(activeId)) return { tabs: next, activeId };
+  const index = tabs.findIndex((tab) => tab.id === activeId);
+  return { tabs: next, activeId: next[Math.min(index, next.length - 1)]?.id ?? null };
+}
+
 function App() {
   const [groups, setGroups] = useState<SessionGroup[]>([]);
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -413,9 +475,11 @@ function App() {
   const [quickConnect, setQuickConnect] = useState("");
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>(loadCollapsed);
   const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null);
-  const [openTabIds, setOpenTabIds] = useState<string[]>([]);
+  /** 已打开的标签实例：同一会话可以有多条，id 各不相同 */
+  const [openTabs, setOpenTabs] = useState<OpenTab[]>([]);
+  /** 当前活动的标签实例 id（不是会话 id） */
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
-  /** 处于左右分屏的标签，最多两块面板 */
+  /** 处于左右分屏的标签实例 id，最多两块面板 */
   const [splitTabIds, setSplitTabIds] = useState<string[]>([]);
   /**
    * 分屏里当前拿到键盘焦点的哪一块：0 左、1 右。
@@ -479,6 +543,13 @@ function App() {
   const [hostKeyPrompt, setHostKeyPrompt] = useState<{
     /** 终端会话触发时带 sessionId，用于信任后重连；隧道触发时为 null */
     sessionId: string | null;
+    /**
+     * 触发这次弹框的标签实例 id；SFTP 面板按当前活动标签记，隧道等旧调用为 null。
+     *
+     * 同一会话可能有多个标签，弹框只保留最近一次请求，靠它记下是谁在等结果；
+     * 信任与重连仍按会话级的 sshTrusted 走。
+     */
+    tabId: string | null;
     info: HostKeyInfo;
     mode: "unknown" | "mismatch";
     /**
@@ -529,14 +600,16 @@ function App() {
   /** 会话主区底部「远程监控」面板是否展开（只记在内存里，不持久化） */
   const [monitorOpen, setMonitorOpen] = useState(false);
   /** 指标：优先取当前活动 SSH 会话的远端主机，没有远端会话时才采本机 */
-  /** 会话 id -> 后端终端注册表里的终端 id（远端指标要用它查底层 SSH 连接） */
+  /** 标签实例 id -> 后端终端注册表里的终端 id（远端指标要用它查底层 SSH 连接） */
   const [terminalIds, setTerminalIds] = useState<Record<string, string>>({});
-  /** 会话 id -> 该会话当前所有活动终端 id（分屏时一个会话有两块终端，terminalIds 只记得最后一块） */
+  /** 标签实例 id -> 该标签当前所有活动终端 id（分屏时一个标签有两块终端，terminalIds 只记得最后一块） */
   const [terminalIdList, setTerminalIdList] = useState<Record<string, string[]>>({});
+  /** 每个标签实例的 TerminalPanel 回调缓存（引用保持稳定，避免面板的建连 effect 反复重跑） */
+  const tabPanelHandlersRef = useRef(new Map<string, TabPanelHandlers>());
   /**
    * terminalIdList 的同步镜像。
    *
-   * 为什么需要：handleTerminalId 要在两个 setState 之间共享「该会话还剩哪些
+   * 为什么需要：handleTerminalId 要在两个 setState 之间共享「该标签还剩哪些
    * terminalId」，而 React 执行 updater 的顺序不保证与 dispatch 顺序一致，
    * 用闭包局部变量传递会让先执行的那个 updater 读到还没赋值的空数组。
    * 因此改为在 handler 里同步算完写进 ref，两个 setState 只消费这份结果；
@@ -840,11 +913,24 @@ function App() {
 
   // 会话被删后关掉对应标签 -> 避免标签指向已不存在的会话
   useEffect(() => {
-    setOpenTabIds((prev) => prev.filter((id) => sessions.some((item) => item.id === id)));
-    setSplitTabIds((prev) => prev.filter((id) => sessions.some((item) => item.id === id)));
+    // 同一会话可能有多个标签实例 -> 按 sessionId 判断会话是否还在
+    setOpenTabs((prev) => {
+      const next = prev.filter((tab) => sessions.some((item) => item.id === tab.sessionId));
+      return next.length === prev.length ? prev : next;
+    });
+    // 分屏集合存的是标签实例 id -> 跟着标签实例一起剪，别留下已不存在的实例
+    setSplitTabIds((prev) => {
+      const next = prev.filter((tabId) => openTabs.some((tab) => tab.id === tabId));
+      return next.length === prev.length ? prev : next;
+    });
+    // 标签实例关掉后顺手清掉它的回调缓存，缓存不跟着标签一起长
+    const aliveTabIds = new Set(openTabs.map((tab) => tab.id));
+    for (const tabId of tabPanelHandlersRef.current.keys()) {
+      if (!aliveTabIds.has(tabId)) tabPanelHandlersRef.current.delete(tabId);
+    }
     // 分屏列表可能少了一条 -> 焦点索引一起归零，别留给已经不存在的右块
     setActivePaneIndex(0);
-  }, [sessions]);
+  }, [sessions, openTabs]);
 
   // 切标签后焦点回到左块：右块可能是新挂载的，旧索引留着会指到看不见的面板上
   useEffect(() => {
@@ -925,15 +1011,30 @@ function App() {
   }, [reloadVault]);
 
   /**
-   * 激活会话标签。
+   * 打开会话标签。
    *
    * 参数：session 为要打开的会话
-   * 核心流程：已打开则切过去，否则追加到标签末尾并激活。
+   * 核心流程：总是新建一个标签实例（同一会话可以开多个标签，各自独立建连）
+   * 并设为激活；实例 id 由当前标签列表推导，不依赖时间戳。
    */
-  const activateSession = (session: Session) => {
-    setOpenTabIds((prev) => (prev.includes(session.id) ? prev : [...prev, session.id]));
-    setActiveTabId(session.id);
+  const openTab = (session: Session) => {
+    const id = nextTabInstanceId(openTabs, session.id);
+    // 同一帧里连着开同一个会话时两次算出的 id 会撞 -> 撞了就只留一条，避免 key 重复
+    setOpenTabs((prev) =>
+      prev.some((tab) => tab.id === id) ? prev : [...prev, { id, sessionId: session.id }],
+    );
+    setActiveTabId(id);
   };
+
+  /**
+   * 切到指定标签。
+   *
+   * 参数：tabId 为标签实例 id
+   * 核心流程：只改激活项，不新建标签。
+   */
+  const focusTab = useCallback((tabId: string) => {
+    setActiveTabId(tabId);
+  }, []);
 
   /**
    * 从凭据库取回私钥口令明文。
@@ -979,7 +1080,7 @@ function App() {
             ...prev,
             [session.id]: { kind: "privateKey", path: resolved.path, passphrase },
           }));
-          activateSession(session);
+          openTab(session);
           return;
         }
         setPendingKeyPass({ session, path: resolved.path });
@@ -994,7 +1095,7 @@ function App() {
       }
       setSshAuths((prev) => ({ ...prev, [session.id]: resolved.auth }));
     }
-    activateSession(session);
+    openTab(session);
   };
 
   /**
@@ -1032,7 +1133,7 @@ function App() {
         [target.id]: { kind: "privateKey", path: resolved.path, passphrase },
       }));
     }
-    activateSession(target);
+    openTab(target);
   };
 
   /**
@@ -1140,7 +1241,7 @@ function App() {
     setSshAuths((prev) => ({ ...prev, [session.id]: auth }));
     setPendingSsh(null);
     setPendingKeyPass(null);
-    activateSession(session);
+    openTab(session);
   };
 
   /**
@@ -1167,35 +1268,114 @@ function App() {
   };
 
   /**
+   * 清掉若干标签实例的终端登记。
+   *
+   * 参数：tabIds 为要清掉的标签实例 id
+   * 核心流程：只删这些实例的键，ref 与 state 同步改；
+   * 标签都关了就不该再留着查不到的终端 id（远程监控、多执行、SFTP 都会读到它）。
+   */
+  const forgetTabTerminals = useCallback((tabIds: Set<string>) => {
+    setTerminalIds((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const tabId of tabIds) {
+        if (!(tabId in next)) continue;
+        delete next[tabId];
+        changed = true;
+      }
+      return changed ? next : prev;
+    });
+    const snapshot = terminalIdListRef.current;
+    let listChanged = false;
+    const nextSnapshot = { ...snapshot };
+    for (const tabId of tabIds) {
+      if (!(tabId in nextSnapshot)) continue;
+      delete nextSnapshot[tabId];
+      listChanged = true;
+    }
+    if (!listChanged) return;
+    terminalIdListRef.current = nextSnapshot;
+    setTerminalIdList(nextSnapshot);
+  }, []);
+
+  /**
+   * 移除若干标签实例并做收尾。
+   *
+   * 参数：removeIds 为要移除的标签实例 id
+   * 核心流程：按实例 id 删标签，活动项被删时由 removeTabsAndPickActive
+   * 回退到相邻实例；分屏集合、焦点索引与终端登记一起清理。
+   * closeTab 与 forgetAndClose 共用，避免两处各写一份回退逻辑。
+   */
+  const removeTabsAndRefocus = (removeIds: Set<string>) => {
+    if (removeIds.size === 0) return;
+    const result = removeTabsAndPickActive(openTabs, removeIds, activeTabId);
+    if (result.tabs === openTabs) return;
+    setOpenTabs(result.tabs);
+    setActiveTabId(result.activeId);
+    setSplitTabIds((prev) => prev.filter((item) => !removeIds.has(item)));
+    setActivePaneIndex(0);
+    forgetTabTerminals(removeIds);
+  };
+
+  /**
    * 关闭标签。
    *
-   * 参数：id 为会话标识
+   * 参数：tabId 为标签实例 id（同一会话的其它标签不受影响）
    * 核心流程：移除标签，若关的是当前标签则切到相邻项。
    */
-  const closeTab = (id: string) => {
-    setSplitTabIds((prev) => prev.filter((item) => item !== id));
-    setActivePaneIndex(0);
-    setOpenTabIds((prev) => {
-      const next = prev.filter((item) => item !== id);
-      if (activeTabId === id) {
-        const index = prev.indexOf(id);
-        const fallback = next[Math.min(index, next.length - 1)] ?? null;
-        setActiveTabId(fallback);
-      }
-      return next;
-    });
+  const closeTab = (tabId: string) => {
+    removeTabsAndRefocus(new Set([tabId]));
+  };
+
+  /**
+   * 复制标签：给同一会话再开一个实例。
+   *
+   * 参数：tabId 为被右键的标签实例 id
+   * 核心流程：先由实例 id 找回会话 id，再按会话 id 查会话；会话已删就不开。
+   * 新实例的标题由渲染层的序号逻辑自动带上 (n) 后缀。
+   */
+  const duplicateTab = (tabId: string) => {
+    const tab = openTabs.find((item) => item.id === tabId);
+    if (!tab) return;
+    const session = sessions.find((item) => item.id === tab.sessionId);
+    if (!session) return;
+    openTab(session);
+  };
+
+  /**
+   * 关闭其它标签，只留右键的那个实例。
+   *
+   * 参数：tabId 为要保留的标签实例 id
+   * 核心流程：其余实例交给 removeTabsAndRefocus 统一收尾（分屏、焦点、终端登记），
+   * 最后把激活项钉在保留的那个实例上。
+   */
+  const closeOtherTabs = (tabId: string) => {
+    const removeIds = new Set(openTabs.filter((tab) => tab.id !== tabId).map((tab) => tab.id));
+    removeTabsAndRefocus(removeIds);
+    setActiveTabId(tabId);
+  };
+
+  /**
+   * 关闭全部标签。
+   *
+   * 参数：无（读 openTabs）
+   * 核心流程：当成「移除所有实例」交给 removeTabsAndRefocus：
+   * 标签、激活项、分屏与终端登记一并清空，不另写一份清理逻辑。
+   */
+  const closeAllTabs = () => {
+    removeTabsAndRefocus(new Set(openTabs.map((tab) => tab.id)));
   };
 
   /**
    * 切换标签分屏。
    *
-   * 参数：id 为会话标识
+   * 参数：tabId 为标签实例 id
    * 核心流程：第一次点击给当前标签加第二块面板，再次点击收回单栏；
    * 分屏列表由顶层维护，关闭标签时一并清理。
    */
-  const toggleSplit = (id: string) => {
+  const toggleSplit = (tabId: string) => {
     setSplitTabIds((prev) =>
-      prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id],
+      prev.includes(tabId) ? prev.filter((item) => item !== tabId) : [...prev, tabId],
     );
     // 收起分屏（以及重新分屏）都把焦点索引归零：右块要么没了，要么是刚建的
     setActivePaneIndex(0);
@@ -1472,14 +1652,48 @@ function App() {
   }, []);
 
   /**
+   * 活动标签实例 id 的同步镜像。
+   *
+   * 为什么用 ref：SFTP 面板的建连 effect 依赖指纹回调，回调引用一变整条连接就会重建；
+   * 用 ref 读「当前活动标签」能让回调引用保持稳定，又不会在触发那一刻拿到旧值。
+   */
+  const activeTabIdRef = useRef<string | null>(null);
+  activeTabIdRef.current = activeTabId;
+
+  /**
+   * 弹指纹确认框，并记下是哪个标签实例触发的。
+   *
+   * 参数：tabId 为触发标签的实例 id（旧调用可为 null），sessionId 为会话 id，
+   * info 为观察到的指纹，mode 区分未知主机与指纹变更
+   * 核心流程：只保留最近一次请求（同一会话的两个标签同时撞上未知主机时，
+   * 后来的覆盖先来的，界面上始终只有一个弹框）；tabId 记下触发实例，
+   * 信任本身仍按会话级的 sshTrusted 生效。
+   */
+  const promptHostKey = useCallback(
+    (
+      tabId: string | null,
+      sessionId: string | null,
+      info: HostKeyInfo,
+      mode: "unknown" | "mismatch",
+    ) => {
+      setHostKeyPrompt({ sessionId, tabId, info, mode });
+    },
+    [],
+  );
+
+  /**
    * 未知主机 -> 弹指纹确认。
    *
    * 参数：sessionId 为触发的会话，info 为观察到的指纹
-   * 核心流程：用固定引用避免 TerminalPanel 的 effect 反复重建。
+   * 核心流程：用固定引用避免 TerminalPanel / SftpPanel 的 effect 反复重建；
+   * 标签实例 id 取当前活动标签（终端面板另外走按实例缓存的闭包，能精确到后台标签）。
    */
-  const handleHostKeyPrompt = useCallback((sessionId: string, info: HostKeyInfo) => {
-    setHostKeyPrompt({ sessionId, info, mode: "unknown" });
-  }, []);
+  const handleHostKeyPrompt = useCallback(
+    (sessionId: string, info: HostKeyInfo) => {
+      promptHostKey(activeTabIdRef.current, sessionId, info, "unknown");
+    },
+    [promptHostKey],
+  );
 
   /**
    * 指纹变更 -> 弹硬阻断提示。
@@ -1487,9 +1701,12 @@ function App() {
    * 参数：sessionId 为触发的会话，info 为观察到的指纹
    * 核心流程：与未知主机分开处理，不允许直接信任。
    */
-  const handleHostKeyMismatch = useCallback((sessionId: string, info: HostKeyInfo) => {
-    setHostKeyPrompt({ sessionId, info, mode: "mismatch" });
-  }, []);
+  const handleHostKeyMismatch = useCallback(
+    (sessionId: string, info: HostKeyInfo) => {
+      promptHostKey(activeTabIdRef.current, sessionId, info, "mismatch");
+    },
+    [promptHostKey],
+  );
 
   /**
    * 隧道等外部调用方请求指纹确认。
@@ -1501,7 +1718,7 @@ function App() {
   const requestHostKeyTrust = useCallback(
     (info: HostKeyInfo) =>
       new Promise<boolean>((resolve) => {
-        setHostKeyPrompt({ sessionId: null, info, mode: "unknown", resolve });
+        setHostKeyPrompt({ sessionId: null, tabId: null, info, mode: "unknown", resolve });
       }),
     [],
   );
@@ -1798,6 +2015,10 @@ function App() {
    * 参数：无（取自当前弹窗）
    * 核心流程：先写库；隧道调用方拿到 resolve(true) 后自己重试，
    * 终端则标记该会话已信任 -> props 变化触发面板重连。
+   *
+   * sshTrusted 保持会话级：同一主机的指纹只该确认一次，确认后该会话的所有标签
+   * 都会带上 acceptUnknownHostKey 一起重连，这是有意为之；tabId 只用来标记
+   * 这次弹框是哪个标签触发的，不改变信任的作用域。
    */
   const trustAndReconnect = async () => {
     const current = hostKeyPrompt;
@@ -1841,7 +2062,8 @@ function App() {
    * 删除旧指纹并关闭该标签。
    *
    * 参数：无（取自当前弹窗）
-   * 核心流程：删记录后收起标签，用户重新点击会话会再次进入确认流程。
+   * 核心流程：删记录后收起该会话的全部标签，用户重新点击会话会再次进入确认流程；
+   * 活动标签被删掉时回退到相邻标签，不再落到欢迎页。
    */
   const forgetAndClose = async () => {
     const current = hostKeyPrompt;
@@ -1857,7 +2079,11 @@ function App() {
           delete next[sessionId];
           return next;
         });
-        setOpenTabIds((prev) => prev.filter((id) => id !== sessionId));
+        // 指纹按主机记录，该会话的所有标签都会带着旧指纹重连 -> 一并关掉；
+        // 活动项在这批里时由 removeTabsAndRefocus 回退到相邻实例
+        removeTabsAndRefocus(
+          new Set(openTabs.filter((tab) => tab.sessionId === sessionId).map((tab) => tab.id)),
+        );
       }
       setNotice({ tone: "info", text: "已删除旧指纹记录，请重新连接并核对新指纹" });
     } catch (err) {
@@ -1868,9 +2094,11 @@ function App() {
   };
 
   const searching = keyword.trim() !== "";
+  /** 当前活动标签实例指向的会话 id；活动标签已不存在时为 null */
+  const activeTabSessionId = openTabs.find((tab) => tab.id === activeTabId)?.sessionId ?? null;
   const activeSession = useMemo(
-    () => sessions.find((session) => session.id === activeTabId) ?? null,
-    [sessions, activeTabId],
+    () => sessions.find((session) => session.id === activeTabSessionId) ?? null,
+    [sessions, activeTabSessionId],
   );
 
   /** 详情页可用的系统远程桌面客户端；null 表示正在检测 */
@@ -1926,18 +2154,19 @@ function App() {
   /**
    * 记录终端面板上报的终端 id。
    *
-   * 参数：sessionId 为会话 id，terminalId 为后端注册表 id（null 表示终端已销毁），
-   * expectedId 为要求注销的那个 id（分屏下同会话有两个终端，用来判断该不该删）
+   * 参数：tabId 为标签实例 id（面板回传的 sessionId 由渲染时的闭包忽略，不按会话登记），
+   * terminalId 为后端注册表 id（null 表示终端已销毁），
+   * expectedId 为要求注销的那个 id（分屏下同一个标签有两块终端，用来判断该不该删）
    * 核心流程：只增删映射，不触发终端重建；注销时若记录已经被另一块面板改写成
    * 新的 id，就原样返回，避免先退出的那一块把还活着的终端一起注销。
    */
   const handleTerminalId = useCallback(
-    (sessionId: string, terminalId: string | null, expectedId?: string) => {
+    (tabId: string, terminalId: string | null, expectedId?: string) => {
       // 先把当前快照读出来（ref 与 state 同步维护，不依赖 updater 执行顺序）。
-      // 同一个会话分屏时右侧 pane 通常是后注册的那个，它退出后左块不会重新上报，
-      // 所以不能直接把 terminalIds[sessionId] 删掉，否则远程监控/SFTP 会一直停在 null。
+      // 同一个标签分屏时右侧 pane 通常是后注册的那个，它退出后左块不会重新上报，
+      // 所以不能直接把 terminalIds[tabId] 删掉，否则远程监控/SFTP 会一直停在 null。
       const snapshot = terminalIdListRef.current;
-      const currentIds = snapshot[sessionId] ?? [];
+      const currentIds = snapshot[tabId] ?? [];
       const remaining =
         terminalId === null
           ? expectedId === undefined
@@ -1950,33 +2179,32 @@ function App() {
       // 先算出新快照并同步写回 ref：ref 是唯一的事实来源，两个 setState 只消费
       // 上面同步算好的结果，绝不再跨 updater 传递变量
       const nextSnapshot = { ...snapshot };
-      if (remaining.length === 0) delete nextSnapshot[sessionId];
-      else nextSnapshot[sessionId] = remaining;
+      if (remaining.length === 0) delete nextSnapshot[tabId];
+      else nextSnapshot[tabId] = remaining;
       // 内容没变就不 setState（重复上报很常见），避免无意义重渲染
-      const listChanged =
-        remaining.length === 0 ? sessionId in snapshot : snapshot[sessionId] !== remaining;
+      const listChanged = remaining.length === 0 ? tabId in snapshot : snapshot[tabId] !== remaining;
       if (listChanged) {
         terminalIdListRef.current = nextSnapshot;
-        // 同步维护「一个会话的全部终端」：分屏时同会话两块终端都要能收到广播，
-        // 只记最后一个的 terminalIds 不够用，这里额外按会话存数组
+        // 同步维护「一个标签的全部终端」：分屏时两块终端都要能收到广播，
+        // 只记最后一个的 terminalIds 不够用，这里额外按标签实例存数组
         setTerminalIdList(nextSnapshot);
       }
 
       setTerminalIds((prev) => {
         if (terminalId !== null) {
-          if (prev[sessionId] === terminalId) return prev;
-          return { ...prev, [sessionId]: terminalId };
+          if (prev[tabId] === terminalId) return prev;
+          return { ...prev, [tabId]: terminalId };
         }
         // 守卫：注销的不是自己注册的那个 id 就不动（另一块面板可能已经接管）
-        if (expectedId !== undefined && prev[sessionId] !== expectedId) return prev;
-        // 同会话还有别的终端活着 -> 回填成剩下那个，而不是把整个会话删掉，
+        if (expectedId !== undefined && prev[tabId] !== expectedId) return prev;
+        // 同一标签还有别的终端活着 -> 回填成剩下那个，而不是把整个标签删掉，
         // 否则 activeTerminalId 变 null，远程监控面板会整块被摘掉
         if (remaining.length > 0) {
-          return { ...prev, [sessionId]: remaining[remaining.length - 1] };
+          return { ...prev, [tabId]: remaining[remaining.length - 1] };
         }
-        if (!(sessionId in prev)) return prev;
+        if (!(tabId in prev)) return prev;
         const next = { ...prev };
-        delete next[sessionId];
+        delete next[tabId];
         return next;
       });
     },
@@ -1984,18 +2212,46 @@ function App() {
   );
 
   /**
-   * 活动标签对应会话的活跃终端 id；没有终端或终端已注销时为 null。
+   * 取某个标签实例的 TerminalPanel 回调。
    *
-   * 参数：无（读 activeSession 与 terminalIds）
-   * 核心流程：只查已有映射，不新增轮询或后端调用；终端卸载/断开时
-   * TerminalPanel 会用 handleTerminalId(sessionId, null) 把条目删掉，这里随之变 null。
+   * 参数：tabId 为标签实例 id
+   * 核心流程：首次用到时建一组闭包并缓存，之后每次渲染都返回同一组引用；
+   * TerminalPanel 的建连 effect 依赖这些回调，引用一变整条连接就会重建；
+   * 闭包捕获 tabId，面板回传的 sessionId 一律不用，终端登记按键到标签实例。
    */
-  const activeTerminalId =
-    activeSession !== null ? (terminalIds[activeSession.id] ?? null) : null;
+  const tabPanelHandlers = (tabId: string): TabPanelHandlers => {
+    const cache = tabPanelHandlersRef.current;
+    const cached = cache.get(tabId);
+    if (cached) return cached;
+    const created: TabPanelHandlers = {
+      onTerminalId: (_sessionId, terminalId, expectedId) => {
+        handleTerminalId(tabId, terminalId, expectedId);
+      },
+      onHostKeyPrompt: (sessionId, info) => {
+        promptHostKey(tabId, sessionId, info, "unknown");
+      },
+      onHostKeyMismatch: (sessionId, info) => {
+        promptHostKey(tabId, sessionId, info, "mismatch");
+      },
+    };
+    cache.set(tabId, created);
+    return created;
+  };
+
+  /**
+   * 活动标签的活跃终端 id；没有终端或终端已注销时为 null。
+   *
+   * 参数：无（读 activeTabId 与 terminalIds）
+   * 核心流程：只查已有映射，不新增轮询或后端调用；终端卸载/断开时
+   * TerminalPanel 会用 handleTerminalId(tabId, null) 把条目删掉，这里随之变 null。
+   */
+  const activeTerminalId = activeTabId !== null ? (terminalIds[activeTabId] ?? null) : null;
 
   /** 指标采样的目标：活动标签是 SSH 会话就采那台远端，其余情况退回本机 */
   const metricsTargetId =
-    activeSession?.protocol === "ssh" ? (terminalIds[activeSession.id] ?? null) : null;
+    activeSession?.protocol === "ssh" && activeTabId !== null
+      ? (terminalIds[activeTabId] ?? null)
+      : null;
   /** SSH 标签已激活但终端还没注册完成 -> 显示「等待终端连接」而不是回落本机 */
   const metricsAwaitingTerminal = activeSession?.protocol === "ssh" && metricsTargetId === null;
   const metricsTargetHost =
@@ -2157,15 +2413,33 @@ function App() {
 
   const selectedGroup = groups.find((group) => group.id === selectedGroupId) ?? null;
 
-  const tabs: TabItem[] = openTabIds
-    .map((id) => sessions.find((session) => session.id === id))
-    .filter((session): session is Session => session !== undefined)
-    .map((session) => ({
-      id: session.id,
-      title: session.name,
-      subtitle: session.host ? `${session.username ?? ""}@${session.host}` : "",
-      protocol: session.protocol,
-    }));
+  // 同一会话开了多个标签时给标题加实例序号：按 openTabs 顺序数，只有一个时保持原名。
+  // 不用实例 id 里的数字后缀：删掉中间一条后新开的会跳号，显示出来反而让人困惑
+  const tabInstanceTotal = new Map<string, number>();
+  for (const tab of openTabs) {
+    tabInstanceTotal.set(tab.sessionId, (tabInstanceTotal.get(tab.sessionId) ?? 0) + 1);
+  }
+  const tabInstanceSeen = new Map<string, number>();
+
+  // 标签按实例 id 渲染，标题等信息从它指向的会话里取；会话已删（剪枝前的那一帧）就跳过
+  const tabs: TabItem[] = openTabs.flatMap((tab) => {
+    const session = sessions.find((item) => item.id === tab.sessionId);
+    if (!session) return [];
+    const ordinal = (tabInstanceSeen.get(tab.sessionId) ?? 0) + 1;
+    tabInstanceSeen.set(tab.sessionId, ordinal);
+    // 序号按 openTabs 顺序数，不用实例 id 的数字后缀（会跳号）
+    const duplicated = (tabInstanceTotal.get(tab.sessionId) ?? 1) > 1;
+    const title = duplicated ? `${session.name} (${ordinal})` : session.name;
+    return [
+      {
+        id: tab.id,
+        sessionId: tab.sessionId,
+        title,
+        subtitle: session.host ? `${session.username ?? ""}@${session.host}` : "",
+        protocol: session.protocol,
+      },
+    ];
+  });
 
   const terminalTabs = tabs.filter((tab) => isTerminalProtocol(tab.protocol));
   const sftpTabs = tabs.filter((tab) => tab.protocol === "sftp");
@@ -2186,7 +2460,8 @@ function App() {
    */
   // terminalTabs 每次渲染都是新数组 -> 用 id 串当依赖，清单引用保持稳定，
   // 否则下面的清理 effect 会白跑
-  const multiExecTabKey = terminalTabs.map((tab) => tab.id).join("|");
+  // 多执行的目标键仍是会话 id -> 同一会话开多个标签时只出现一行
+  const multiExecTabKey = Array.from(new Set(terminalTabs.map((tab) => tab.sessionId))).join("|");
   const multiExecTargetList = useMemo<MultiExecTarget[]>(() => {
     const ids = multiExecTabKey === "" ? [] : multiExecTabKey.split("|");
     return ids.flatMap((id) => {
@@ -2201,6 +2476,7 @@ function App() {
    * 参数：text 为用户在输入条里敲的命令（可能含换行）
    * 核心流程：多行归一成 \r 并把每条补上回车 -> 逐会话写一次（分屏就写两遍，
    * 两块终端各有自己的终端 id）-> allSettled 汇总成功/失败条数，绝不抛异常。
+   * 终端登记按标签实例存 -> 目标仍是会话，这里从 openTabs 筛出该会话的所有实例再查。
    */
   const sendMultiExec = useCallback(
     async (text: string): Promise<{ ok: number; failed: number }> => {
@@ -2208,14 +2484,17 @@ function App() {
       const data = textToBase64(payload.endsWith("\r") ? payload : `${payload}\r`);
       const ids: string[] = [];
       for (const sessionId of multiExecTargets) {
-        const list = terminalIdList[sessionId];
-        if (list !== undefined && list.length > 0) {
-          ids.push(...list);
-          continue;
+        for (const tab of openTabs) {
+          if (tab.sessionId !== sessionId) continue;
+          const list = terminalIdList[tab.id];
+          if (list !== undefined && list.length > 0) {
+            ids.push(...list);
+            continue;
+          }
+          // 还没记录到数组（例如旧状态）就退回单条映射
+          const single = terminalIds[tab.id];
+          if (single !== undefined) ids.push(single);
         }
-        // 还没记录到数组（例如旧状态）就退回单条映射
-        const single = terminalIds[sessionId];
-        if (single !== undefined) ids.push(single);
       }
       if (ids.length === 0) return { ok: 0, failed: 0 };
       const results = await Promise.allSettled(ids.map((id) => writeLocalTerminal(id, data)));
@@ -2227,7 +2506,7 @@ function App() {
       }
       return { ok, failed };
     },
-    [multiExecTargets, terminalIdList, terminalIds],
+    [multiExecTargets, openTabs, terminalIdList, terminalIds],
   );
 
   /**
@@ -2583,7 +2862,7 @@ function App() {
           <div
             key={session.id}
             className={`tree-row session-item ${
-              activeTabId === session.id ? "is-active" : ""
+              activeTabSessionId === session.id ? "is-active" : ""
             }`}
             onClick={() => openSession(session)}
           >
@@ -2710,7 +2989,8 @@ function App() {
         cwd={cwdByTarget[targetKey(sftpSession)] ?? null}
         followCwd={followCwd}
         onFollowCwdChange={(next) => applySetting("sftpFollowCwd", next)}
-        terminalId={terminalIds[sftpSession.id] ?? null}
+        // 终端登记按标签实例存 -> 跟随终端就是当前活动标签的那一块
+        terminalId={activeTabId !== null ? (terminalIds[activeTabId] ?? null) : null}
       />
     );
   };
@@ -2845,24 +3125,24 @@ function App() {
         setPaletteOpen(true);
       } else if (hit("prevTab")) {
         // 没有标签时放行：Alt+Left 留给页面/终端的默认行为
-        if (openTabIds.length > 0) {
+        if (openTabs.length > 0) {
           event.preventDefault();
           event.stopPropagation();
           // 首个标签再往前 -> 末尾；当前标签不在列表里（异常）也落到末尾
-          const index = activeTabId === null ? -1 : openTabIds.indexOf(activeTabId);
-          const target = index <= 0 ? openTabIds[openTabIds.length - 1] : openTabIds[index - 1];
+          const index = activeTabId === null ? -1 : openTabs.findIndex((tab) => tab.id === activeTabId);
+          const target = index <= 0 ? openTabs[openTabs.length - 1].id : openTabs[index - 1].id;
           // 单标签时 target 等于当前值，跳过 setState 避免无谓重渲染
-          if (target !== activeTabId) setActiveTabId(target);
+          if (target !== activeTabId) focusTab(target);
         }
       } else if (hit("nextTab")) {
-        if (openTabIds.length > 0) {
+        if (openTabs.length > 0) {
           event.preventDefault();
           event.stopPropagation();
           // 末尾标签再往后 -> 首个；当前标签不在列表里（异常）也落到首个
-          const index = activeTabId === null ? -1 : openTabIds.indexOf(activeTabId);
+          const index = activeTabId === null ? -1 : openTabs.findIndex((tab) => tab.id === activeTabId);
           const target =
-            index === -1 || index === openTabIds.length - 1 ? openTabIds[0] : openTabIds[index + 1];
-          if (target !== activeTabId) setActiveTabId(target);
+            index === -1 || index === openTabs.length - 1 ? openTabs[0].id : openTabs[index + 1].id;
+          if (target !== activeTabId) focusTab(target);
         }
       } else if (hit("prevPane")) {
         // 没分屏就没有「另一块」-> 键位放行，行为和标签切换以外的默认动作一致
@@ -2889,10 +3169,11 @@ function App() {
   }, [
     settings.shortcuts,
     activeTabId,
-    openTabIds,
+    openTabs,
     activeHasTerminal,
     activeSplit,
     focusPane,
+    focusTab,
     startImport,
     closeTab,
     toggleSplit,
@@ -2987,7 +3268,7 @@ function App() {
       },
     });
 
-    // 动态：已打开的标签
+    // 动态：已打开的标签（同一会话的多个标签各占一条，id 用标签实例 id）
     for (const tab of tabs) {
       list.push({
         id: `tab:${tab.id}`,
@@ -2996,13 +3277,13 @@ function App() {
         group: "跳转",
         hint: tab.subtitle,
         keywords: ["tab", "switch"],
-        run: () => setActiveTabId(tab.id),
+        run: () => focusTab(tab.id),
       });
     }
 
     // 动态：还没打开的会话
     for (const session of sessions) {
-      if (openTabIds.includes(session.id)) continue;
+      if (openTabs.some((tab) => tab.sessionId === session.id)) continue;
       list.push({
         id: `session:${session.id}`,
         title: session.name,
@@ -3145,12 +3426,13 @@ function App() {
     settings.shortcuts,
     tabs,
     sessions,
-    openTabIds,
+    openTabs,
     paletteTunnels,
     activeTabId,
     activeHasTerminal,
     activeSplit,
     focusPane,
+    focusTab,
     toggleMultiExec,
     sidebarVisible,
     startTunnel,
@@ -3228,7 +3510,7 @@ function App() {
                     sessions={sessions}
                     collapsed={collapsed}
                     selectedGroupId={selectedGroupId}
-                    selectedSessionId={activeTabId}
+                    selectedSessionId={activeTabSessionId}
                     onToggleGroup={toggleGroup}
                     onSelectGroup={setSelectedGroupId}
                     onOpenSession={openSession}
@@ -3291,8 +3573,11 @@ function App() {
           <TabBar
             tabs={tabs}
             activeId={activeTabId}
-            onSelect={setActiveTabId}
+            onSelect={focusTab}
             onClose={closeTab}
+            onDuplicate={duplicateTab}
+            onCloseOthers={closeOtherTabs}
+            onCloseAll={closeAllTabs}
             sidebarVisible={sidebarVisible}
             onToggleSidebar={() => setSidebarVisible((prev) => !prev)}
           />
@@ -3300,7 +3585,7 @@ function App() {
           <div className="tab-body">
             {/* 终端常驻 -> 切换标签不会重建会话 */}
             {terminalTabs.map((tab) => {
-              const tabSession = sessions.find((item) => item.id === tab.id);
+              const tabSession = sessions.find((item) => item.id === tab.sessionId);
               if (!tabSession) return null;
               const split = splitTabIds.includes(tab.id);
               // 两块终端各自独立建连接；外面再套停靠容器时，主区变窄会触发
@@ -3308,6 +3593,8 @@ function App() {
               // 活动态只在分屏时出现在 DOM 上 -> 单屏永远不会画出描边；
               // ref 只在「当前标签」上挂：所有标签的面板都常驻，全挂会让句柄指向最后一个标签
               const isActiveTab = activeTabId === tab.id;
+              // 回调按标签实例缓存：终端登记记到 tab.id，引用也保持稳定（否则面板会反复重连）
+              const tabHandlers = tabPanelHandlers(tab.id);
               const terminalSplit = (
                 <div className="terminal-split">
                   <div
@@ -3324,10 +3611,10 @@ function App() {
                       onFontSizeChange={(next) => applySetting("terminalFontSize", next)}
                       sshAuth={sshAuths[tabSession.id]}
                       acceptUnknownHostKey={sshTrusted[tabSession.id] === true}
-                      onHostKeyPrompt={handleHostKeyPrompt}
-                      onHostKeyMismatch={handleHostKeyMismatch}
+                      onHostKeyPrompt={tabHandlers.onHostKeyPrompt}
+                      onHostKeyMismatch={tabHandlers.onHostKeyMismatch}
                       onCwdChange={handleCwdChange}
-                      onTerminalId={handleTerminalId}
+                      onTerminalId={tabHandlers.onTerminalId}
                       banner={settings.terminalBanner}
                       followCwd={settings.sftpFollowCwd}
                       onCloseTab={() => closeTab(tab.id)}
@@ -3351,10 +3638,10 @@ function App() {
                         onFontSizeChange={(next) => applySetting("terminalFontSize", next)}
                         sshAuth={sshAuths[tabSession.id]}
                         acceptUnknownHostKey={sshTrusted[tabSession.id] === true}
-                        onHostKeyPrompt={handleHostKeyPrompt}
-                        onHostKeyMismatch={handleHostKeyMismatch}
+                        onHostKeyPrompt={tabHandlers.onHostKeyPrompt}
+                        onHostKeyMismatch={tabHandlers.onHostKeyMismatch}
                         onCwdChange={handleCwdChange}
-                        onTerminalId={handleTerminalId}
+                        onTerminalId={tabHandlers.onTerminalId}
                         banner={settings.terminalBanner}
                         followCwd={settings.sftpFollowCwd}
                         onClosePane={() => toggleSplit(tab.id)}
@@ -3377,7 +3664,7 @@ function App() {
             })}
 
             {sftpTabs.map((tab) => {
-              const tabSession = sessions.find((item) => item.id === tab.id);
+              const tabSession = sessions.find((item) => item.id === tab.sessionId);
               if (!tabSession) return null;
               return (
                 <div

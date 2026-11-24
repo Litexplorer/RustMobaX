@@ -1333,6 +1333,47 @@ body.is-resizing-sidebar * {
   color: var(--danger);
 }
 
+/* 标签右键菜单：fixed 跟着右键落点走，层级高于标签栏与各种下拉（50），低于弹窗（100） */
+.tab-menu {
+  position: fixed;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  padding: 4px;
+  min-width: 140px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: var(--shadow-menu);
+}
+
+/* 菜单项自绘成纯文字按钮：全局 button 的底色 / 边框 / 内边距都在这里被覆盖掉 */
+.tab-menu-item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  padding: 6px 10px;
+  font-size: 12px;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.tab-menu-item:hover:not(:disabled) {
+  background: var(--accent-soft);
+  border-color: transparent;
+  color: var(--text);
+}
+
+/* 只剩一个标签时「关闭其他 / 全部关闭」没有意义 -> 降透明度，且不显示可点的手型 */
+.tab-menu-item:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
 .tab-body {
   position: relative;
   flex: 1;
